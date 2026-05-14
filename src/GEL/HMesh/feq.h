@@ -9,6 +9,8 @@
  * @brief Compute the decomposition of a FEQ mesh
  */
 
+#pragma once
+
 
 #ifndef GEL_FEQ_H
 #define GEL_FEQ_H
