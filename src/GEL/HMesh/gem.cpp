@@ -52,7 +52,7 @@ HMesh::VertexSet boundary_verts(const HMesh::Manifold& m, const HMesh::FaceSet& 
     return vsb;
 }
 
- /* ----------------------------------------------------------------------- *
+/* ----------------------------------------------------------------------- *
  * Find the set of boundary halfedges from a set of faces (fs) with disk topology
  * ----------------------------------------------------------------------- */
 HMesh::HalfEdgeSet boundary_hes(const HMesh::Manifold &m, HMesh::FaceSet& fs) {
@@ -69,7 +69,7 @@ HMesh::HalfEdgeSet boundary_hes(const HMesh::Manifold &m, HMesh::FaceSet& fs) {
 }
 
 
- /* ----------------------------------------------------------------------- *
+/* ----------------------------------------------------------------------- *
  * Purpose of function: To compute how many vertices the polygonal face f consists of
  * ----------------------------------------------------------------------- */
  int face_valency(HMesh::Manifold &m, HMesh::FaceID f) {
@@ -83,7 +83,7 @@ HMesh::HalfEdgeSet boundary_hes(const HMesh::Manifold &m, HMesh::FaceSet& fs) {
     return counter;
 }
 
- /* ----------------------------------------------------------------------- *
+/* ----------------------------------------------------------------------- *
  * Purpose of function: To find the boundary vertices of a set of faces (patch_faces)
  * in a counter clock-wise manner starting from the boundary vertex (ref_v)
  * ----------------------------------------------------------------------- */
@@ -120,7 +120,7 @@ std::vector<HMesh::VertexID> find_boundary_vertices(const HMesh::Manifold &m, HM
     return bd_vertices;
 }
 
- /* ----------------------------------------------------------------------- *
+/* ----------------------------------------------------------------------- *
  * Purpose of function: To find the boundary edges of a set of faces (patch_faces)
  * in a counter clock-wise manner starting from the boundary edge originating from boundary vertex (ref_v)
  * ----------------------------------------------------------------------- */

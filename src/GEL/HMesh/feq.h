@@ -16,10 +16,20 @@
 #ifndef GEL_FEQ_H
 #define GEL_FEQ_H
 
-#include <iostream>
-#include <fstream>
+#include <GEL/CGLA/CGLA.h>
+#include <GEL/HMesh/HMesh.h>
+#include <GEL/Geometry/Graph.h>
+#include <stack>
+#include "HarmonicMap.h"
+
+#include <Eigen/Dense>
+#include <Eigen/Sparse>
+#include <GEL/Geometry/KDTree.h>
 
 
+ /* ----------------------------------------------------------------------- *
+  * Struct to store an extrusion element
+  * ----------------------------------------------------------------------- */
 struct Extrusion {
 
     HMesh::FaceID origin_face;
@@ -85,5 +95,144 @@ struct Extrusion {
 
 };
 
+
+/* ----------------------------------------------------------------------- *
+ * The Generic Extrusion which is used to discretize the 2D continuous coordinates
+ * of the Harmonic Map paramterized patches
+ * ----------------------------------------------------------------------- */
+class Generic_Extrusion{
+    
+    // The Manifold
+    HMesh::Manifold m;
+    
+    // Set the orientation
+    HMesh::FaceID origin_face;
+    HMesh::FaceID right_face;
+    HMesh::FaceID bd_f;
+    HMesh::VertexID ref_v;
+    HMesh::HalfEdgeID bd_h;
+    
+    // The faces in the middle of the shape
+    HMesh::FaceSet base_face_set;
+    
+    // Boundary vertices of the base fase set
+    std::vector<HMesh::VertexID> boundary_vertices;
+
+    // Boundary vertices on the entire extrusion (so the rim of the generic extrusion)
+    HMesh::VertexSet rim_vertices;
+    
+    // All the faces on the generic extrusion
+    HMesh::FaceSet curr_ext_faces;
+    
+    // The positions of the mesh
+    HMesh::VertexAttributeVector<CGLA::Vec3d> pos;
+    
+    // For the uv-map
+    std::map<HMesh::VertexID, std::pair<int, HMesh::VertexID>> base_loop_v_map;
+    
+    // For the vertex to uv_map
+    std::map<HMesh::VertexID, CGLA::Vec2d> vertex_uv_map;
+ 
+    // GEL kDtree
+    Geometry::KDTree<CGLA::Vec2d, int> uv_tree;
+    
+    
+public:
+    
+    // Initialize the class function
+    Generic_Extrusion();
+
+
+    // TC: The purpose of this function is
+    std::vector<HMesh::VertexID> get_neighbours(Eigen::MatrixXd curr_loop_V) {
+            
+        // Store the vertices of the found boundary loop
+        std::vector<HMesh::VertexID> closest_vertices;
+
+        // Loop through all the vertices in the loop
+        for (int ii = 0; ii < curr_loop_V.rows(); ii++) {
+            CGLA::Vec2d uv, uv_closest_point;
+            int index;
+            double inf = std::numeric_limits<double>::infinity();
+            
+            uv[0] = curr_loop_V(ii, 0);
+            uv[1] = curr_loop_V(ii, 1);
+            uv_tree.closest_point(uv, inf, uv_closest_point, index);
+            
+            // Insert the vertex ID into the list
+            closest_vertices.push_back(HMesh::VertexID(index));
+        }
+        return closest_vertices;
+    }
+    
+    HMesh::VertexID get_closest_vertex(CGLA::Vec2d uv_coordinate) {
+        CGLA::Vec2d uv_closest_point;
+        int index;
+        double inf = std::numeric_limits<double>::infinity();
+        uv_tree.closest_point(uv_coordinate, inf, uv_closest_point, index);
+        
+        return HMesh::VertexID(index);
+    }
+
+    HMesh::VertexID get_closest_vertex_on_the_rim(CGLA::Vec2d uv_coordinate) {
+        CGLA::Vec2d uv_closest_point;
+        int index;
+        double inf = std::numeric_limits<double>::infinity();
+        uv_tree.closest_point(uv_coordinate, inf, uv_closest_point, index);
+        auto v = HMesh::VertexID(index);
+        HMesh::VertexID v_on_rim;
+
+        circulate_vertex_ccw(m, v,[&](HMesh::VertexID vn){
+            if (rim_vertices.find(vn) != rim_vertices.end()) {
+              v_on_rim = vn; 
+            }
+        });
+        
+        return v_on_rim;
+    }
+    
+    CGLA::Vec2d vertex_to_uv(HMesh::VertexID v_index) {
+        return vertex_uv_map.find(v_index)->second;
+    }
+    
+    // Get functions
+    std::map<HMesh::VertexID, CGLA::Vec2d> get_vertex_uv_map() {return vertex_uv_map;}
+    
+    HMesh::FaceSet get_curr_ext_faces() {return curr_ext_faces;}
+     
+    HMesh::VertexAttributeVector<CGLA::Vec3d> get_pos() {return pos;}
+    
+    HMesh::Manifold get_m() {return m;}
+    
+    std::vector<HMesh::VertexID> get_boundary_vertices() {return boundary_vertices;}
+
+    HMesh::VertexSet get_rim_vertices() {return rim_vertices;}
+    
+    HMesh::FaceSet get_base_face_set() {return base_face_set;}
+};
+
+/* ----------------------------------------------------------------------- *
+ * Struct which stores all the data pertaining to a face loop
+ * ----------------------------------------------------------------------- */
+struct FaceLoop {
+    std::vector<HMesh::HalfEdgeID> hvec;
+    HMesh::HalfEdgeSet hset;
+    HMesh::FaceSet double_cross_faces;
+    HMesh::FaceSet interior;
+    HMesh::FaceSet face_loop_faces; // TC: Added by TC
+    HMesh::VertexSet vertex_ring;
+    int interior_faces = 0;
+    double area = 0;
+    double avg_len = 0;
+    double interior_area = 0;
+    double cylindricity = 0;
+    double valency_imbalance = 0;
+    double integral_geodesic_curvature = 0;
+    double radius = 0.0;
+    double perimeter = 0.0;
+    CGLA::Vec3d avg_edge = CGLA::Vec3d(0,0,0);
+    CGLA::Vec3d center = CGLA::Vec3d(0,0,0);
+    int id=-1;
+};
 
 #endif

@@ -2,10 +2,84 @@
 #include "gem.h"
 #include "HarmonicMap.h"
 
+
+
+
+/* ----------------------------------------------------------------------- *
+ * Given a HalfEdgeID h, this function traces the face-loop, which h is part of
+ * and finds all faces that make up a patch above the face-loop. The direction of the 
+ * HalfEdge indicates, which way is 'up', and therefore which set of faces is above
+ * the face-loop
+ * ----------------------------------------------------------------------- */
+HMesh::FaceSet find_interior_faces(Manifold &m, HMesh::HalfEdgeID h) {
+
+
+   HalfEdgeAttributeVector<int> touched(m.no_halfedges(), 0);
+   FaceLoop l = trace_face_loop(m, touched, h);
+
+   HMesh::FaceSet curr_faces, interior_faces;
+
+   for(auto h : l.hvec) {
+        curr_faces.insert(m.walker(h).face());
+   }
+
+    HMesh::HalfEdgeID h_above, h_below;
+
+    h_above = m.walker(h).next().opp().next().halfedge();
+    h_below = m.walker(h).prev().opp().prev().halfedge();
+
+    //find interior face set
+    FaceAttributeVector<int> face_status(m.no_faces(),0);
+    FaceAttributeVector<int> face_visited(m.no_faces(),0);
+
+
+    for(auto f : curr_faces) {
+        face_status[f] = 1;
+    }
+
+    queue<HMesh::FaceID> fq;
+    HMesh::FaceID leaf_face = HMesh::InvalidFaceID;
+    if(check_leaf(m, h, 0)) {
+        leaf_face = m.walker(h_above).face();
+    }
+    else if(check_leaf(m,h,1)) {
+        leaf_face = m.walker(h_below).face();
+    }
+
+    fq.push(leaf_face);
+    face_visited[leaf_face] = 1;
+
+    int count = 0;
+
+    while(!fq.empty()) {
+        auto f = fq.front();
+        fq.pop();
+        interior_faces.insert(f);
+        FaceSet nb_faces;
+        circulate_face_ccw(m, f, [&](FaceID fn){
+            nb_faces.insert(fn);
+        });
+        for(auto fn : nb_faces) {
+          if(face_visited[fn] == 0 && face_status[fn] != 1 && interior_faces.find(fn) == interior_faces.end()) {
+            fq.push(fn);
+            face_visited[fn] = 1;
+          }
+        }
+    
+        count++;
+    }
+    return interior_faces;
+}
+
+
 /* ----------------------------------------------------------------------- *
  * The Purpose of this function is to kill one extrusion element at a time
  * ----------------------------------------------------------------------- */
-std::pair< std::map<int,Extrusion>, std::map<HMesh::FaceID, std::tuple<int, std::vector<HMesh::HalfEdgeID>, bool, HMesh::FaceSet>> > kill_individual_extrusions_hmap(Manifold &m, HalfEdgeID h, int pos_flag, Generic_Extrusion &gen_ext, HMesh::VertexID start_vertex) {
+std::pair< std::map<int,Extrusion>, std::map<HMesh::FaceID, std::tuple<int, std::vector<HMesh::HalfEdgeID>, bool, HMesh::FaceSet>> > kill_individual_extrusions_hmap(HMesh::Manifold &m, 
+                                                                                                                                                                    HMesh::HalfEdgeID h, 
+                                                                                                                                                                    int pos_flag, 
+                                                                                                                                                                    Generic_Extrusion &gen_ext, 
+                                                                                                                                                                    HMesh::VertexID start_vertex) {
     
     //std::cout << "Inside kill_individual_extrusions_hmap" << std::endl;
 
@@ -25,24 +99,20 @@ std::pair< std::map<int,Extrusion>, std::map<HMesh::FaceID, std::tuple<int, std:
     //TC:  These just appear to be vectors
     extrusion_id_full = FaceAttributeVector<int>(m.no_faces(), -1);
     
-    //TC: This appears to be some sort of dictionary, where you can insert elements in
+    // TC:This appears to be some sort of dictionary, where you can insert elements in
     // a tuple <key, value>, where the elements are sorted by the key-value.
     // Here the value is of type extrusion, so it seems like this is some sort of variable
     // that Karran defined.
     extrusion_tree.clear();
-    
-    // TC: This apperas to be a C++ set, so a list containing ints, where the elements in the list are sorted
-    // based on their value.
-    bd_v_found.clear();
-    
-    global_ext_id = 0;
+
+    int global_ext_id = 0;
     
     // TC: Some half-edge id values
-    HalfEdgeID curr_h, h_next, global_h;
+    HMesh::HalfEdgeID curr_h, h_next, global_h;
     global_h = h;
     
     // TC: curr_patch_faces seems to be a C++ set, so some sort of list.
-    FaceSet curr_patch_faces;
+    HMesh::FaceSet curr_patch_faces;
     int curr_stack_size, break_flag = 0;
     // TC: Just a variable to be used later on for reducing the feature edges.
     int num_edges;
@@ -56,8 +126,8 @@ std::pair< std::map<int,Extrusion>, std::map<HMesh::FaceID, std::tuple<int, std:
     double source_boundary_perim = 0.0;
     
     // TC: Vector to store the feature edges
-    vector<HalfEdgeID> global_feature_edges;
-    vector<HalfEdgeID> feature_edges, feature_edges_above, feature_edges_below;
+    std::vector<HMesh::HalfEdgeID> global_feature_edges;
+    std::vector<HMesh::HalfEdgeID> feature_edges, feature_edges_above, feature_edges_below;
     
     int counter = 0;
 
@@ -338,38 +408,7 @@ std::pair< std::map<int,Extrusion>, std::map<HMesh::FaceID, std::tuple<int, std:
         if (save_intermediate_meshes) {
             obj_save("test_mesh_" + to_string(counter) + ".obj", m);
         }
-        
-        /*
-        if (curr_ext.id == 64) {
-     
-            cout << "Debugging Extrusion ID: " << curr_ext.id << endl;
-            cout << "Base face set: ";
-            for (auto f : curr_ext.base_face_set) {
-                cout << f << " ";
-            }
-
-            
-            HalfEdgeSet all_bd_edges;
-            HalfEdgeSet boundary_edges = boundary_hes(m, curr_ext.base_face_set);
-            for (auto h : boundary_edges) {
-                all_bd_edges.insert(h);
-                all_bd_edges.insert(m.walker(h).opp().halfedge());
-            }
-            HMesh::HalfEdgeID upward_edge;
-            circulate_vertex_ccw(m, curr_ext.bd_v, [&](HMesh::HalfEdgeID h) {
-                if (all_bd_edges.find(h) == all_bd_edges.end()) {
-                    upward_edge = m.walker(h).opp().halfedge();
-                }
-            });
-            cout << "Upward edge: " << upward_edge << endl;
-            cout << endl;
-            cout << "bd_v: " << curr_ext.bd_v << endl;
-            
-            
-            break;
-        }
-        */
-
+    
         ext = curr_ext;
         
         //return ext;
@@ -388,9 +427,6 @@ std::pair< std::map<int,Extrusion>, std::map<HMesh::FaceID, std::tuple<int, std:
     cout<<"returning"<<endl;
     cout.flush();
 
-    //FaceSet test_fs;
-    //return ext;
-    //process extrusion now.
 
     // TC: Update child nodes
     for (int ii = extrusion_tree.size() - 1; ii >= 0; ii--) {
@@ -412,8 +448,7 @@ std::pair< std::map<int,Extrusion>, std::map<HMesh::FaceID, std::tuple<int, std:
         }
     }
 
-    //cout << "Before updating the extrusion" << endl;
-    //cout.flush();
+    // Updating the extrusions with a new boundary vertex as refernece point
     update_extrusions(m, start_vertex);
 
     return {extrusion_tree, face_loop_prev_edge};
