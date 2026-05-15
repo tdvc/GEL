@@ -20,6 +20,19 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Darwin")
     set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64" CACHE STRING "Build architectures for MacOS" FORCE)
 endif ()
 
+
+# Libigl
+include(FetchContent)
+
+FetchContent_Declare(
+    libigl
+    GIT_REPOSITORY https://github.com/libigl/libigl.git
+    GIT_TAG v2.6.0 # or another specific release/tag/commit
+)
+
+FetchContent_MakeAvailable(libigl)
+
+
 # Eigen library
 find_package(Eigen3 3.3 REQUIRED)
 include_directories(${EIGEN3_INCLUDE_DIR})
@@ -78,10 +91,10 @@ if (Use_GLGraphics)
     list(APPEND GLG_SRC_LIST ${GLG_SRC_LIST_CPP} ${GLG_SRC_LIST_C})
     target_sources(GEL PRIVATE ${GL_SRC_LIST} ${GLG_SRC_LIST} ${CGLA_SRC_LIST} ${GEO_SRC_LIST} ${MESH_SRC_LIST} ${UTIL_SRC_LIST})
     target_include_directories(GEL PRIVATE ./src/GEL/GL/include)
-    target_link_libraries(GEL PRIVATE Threads::Threads OpenGL::GLU OpenGL::GL ${COCOA_LIBRARY})
+    target_link_libraries(GEL PRIVATE Threads::Threads OpenGL::GLU OpenGL::GL ${COCOA_LIBRARY} igl::core)
 else ()
     target_sources(GEL PRIVATE ${CGLA_SRC_LIST} ${GEO_SRC_LIST} ${MESH_SRC_LIST} ${UTIL_SRC_LIST})
-    target_link_libraries(GEL PRIVATE Threads::Threads)
+    target_link_libraries(GEL PRIVATE Threads::Threads igl::core)
 endif ()
 
 # Locate the sources for PyGEL
