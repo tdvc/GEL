@@ -417,7 +417,7 @@ void HarmonicMap::init_HarmonicMap(HMesh::Manifold m, HMesh::FaceSet patch_faces
   // -------------------------
   // Compute the boundary vertices
   // -------------------------
-  VertexSet bd_vs = boundary_verts(m, patch_faces);
+  HMesh::VertexSet bd_vs = boundary_verts(m, patch_faces);
 
   assert(bd_vs.find(ref_v) != bd_vs.end());
 
@@ -782,7 +782,6 @@ std::map<HMesh::VertexID, CGLA::Vec2d> HarmonicMap::compute_normal_harmonic_map_
     // Map the boundary faces to the circle with radius r = 1.1
     double radius = 1.1;
     bd_edges = find_boundary_edges_from_ref_v(m, patch_faces, ref_v);
-    auto patch_edges = extended_patch_edges(m, patch_faces);
     auto bd_edges_set = boundary_hes(m, patch_faces);
     for (int ii = 0; ii < bd_edges.size(); ii++) {
 

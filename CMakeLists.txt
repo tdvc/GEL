@@ -23,13 +23,11 @@ endif ()
 
 # Libigl
 include(FetchContent)
-
 FetchContent_Declare(
     libigl
     GIT_REPOSITORY https://github.com/libigl/libigl.git
     GIT_TAG v2.6.0 # or another specific release/tag/commit
 )
-
 FetchContent_MakeAvailable(libigl)
 
 
