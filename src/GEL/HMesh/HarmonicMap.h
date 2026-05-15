@@ -17,6 +17,7 @@
 #include <GEL/CGLA/Vec2d.h>
 #include <GEL/CGLA/Vec2f.h>
 #include <GEL/CGLA/Vec3f.h>
+#include <GEL/CGLA/Mat3x3d.h>
 #include <GEL/HMesh/Manifold.h>
 #include <Eigen/Dense>
 #include <Eigen/Sparse>

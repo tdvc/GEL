@@ -9,4 +9,18 @@
 #define gem_hpp
 
 
+#include <GEL/HMesh/HMesh.h>
+#include <GEL/HMesh/Manifold.h>
+
+
+
+int face_valency(HMesh::Manifold &m, HMesh::FaceID f);
+
+HMesh::HalfEdgeSet boundary_hes(const HMesh::Manifold &m, HMesh::FaceSet& fs);
+
+std::vector<HMesh::VertexID> find_boundary_vertices(const HMesh::Manifold &m, HMesh::FaceSet patch_faces, HMesh::VertexID ref_v);
+
+std::vector<HMesh::HalfEdgeID> find_boundary_edges_from_ref_v(const HMesh::Manifold &m, HMesh::FaceSet patch_faces, HMesh::VertexID ref_v);
+
+
 #endif /* gem_hpp */
