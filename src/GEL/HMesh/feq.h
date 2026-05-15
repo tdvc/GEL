@@ -19,6 +19,7 @@
 #include <GEL/CGLA/CGLA.h>
 #include <GEL/HMesh/HMesh.h>
 #include <GEL/Geometry/Graph.h>
+#include <GEL/HMesh/Manifold.h>
 #include <stack>
 #include "HarmonicMap.h"
 
