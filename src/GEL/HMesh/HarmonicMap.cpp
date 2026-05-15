@@ -8,8 +8,6 @@
 #include <HarmonicMap.h>
 
 
-
-
 /* ----------------------------------------------------------------------- *
  * Given a 2D point with coordinates (uv), the point might be outside the parameterized mesh
  * if the mesh is very coarse. E.g. if the mesh is a right angled square, then the boundary vertices
@@ -47,8 +45,366 @@ Vec2d HarmonicMap::find_bd_intersection(Vec2d uv) {
   return Vec2d(0.0);
 }
 
+/* ----------------------------------------------------------------------- *
+ * Given a 2D point p with coordinates (uv), the 2D positions of the vertices in the parameterized patch V,
+ * and a matrix specifying which triangle faces are made up of vertices F, the purpose of this function is to compute, which
+ * triangle face contains the point p, and the vertices of this triangle face (vertex_ids), and the barycentric coordinates
+ * of the point p (bary_coords)
+ * ----------------------------------------------------------------------- */
+int find_barycentric_coords(MatrixXd p, MatrixXd V, MatrixXi F, VectorXd& bary_coords, VectorXi& vertex_ids) {
+
+  double eps = 1e-6;
+
+  MatrixXd curr_bary_coords;
+  for(int i = 0; i < F.rows(); i++) {
+    MatrixXd Va = V.row(F(i,0));
+    MatrixXd Vb = V.row(F(i,1));
+    MatrixXd Vc = V.row(F(i,2));
+
+    igl::barycentric_coordinates(p, Va, Vb, Vc, curr_bary_coords);
+
+    bool inside = true;
+
+    for(int j = 0; j < 3; j++) {
+      double c = curr_bary_coords(j);
+      if(c > 1 + eps || c < -eps || std::isnan(c))
+        inside = false;
+    }
+
+    if(inside) {
+
+      VectorXi v_ids(3);
+      vertex_ids.resize(3);
+      bary_coords.resize(3);
+      vertex_ids(0) = F(i,0);
+      vertex_ids(1) = F(i,1);
+      vertex_ids(2) = F(i,2);
+      bary_coords(0) = curr_bary_coords(0,0);
+      bary_coords(1) = curr_bary_coords(0,1);
+      bary_coords(2) = curr_bary_coords(0,2);
+
+      return i;
+    }
+  }
+  return -1;
+}
+
+/* ----------------------------------------------------------------------- *
+ * Given two 2D points p1 and p2, find the intersection between the line segment between p1 and p2 
+ * and the unit circle - Used in later functions to determine the 3D position of a point in the parameterized map
+ * ----------------------------------------------------------------------- */
+CGLA::Vec2d intersectRayWithUnitCircle(const CGLA::Vec2d& p1, const CGLA::Vec2d& p2) {
+    Vec2d v = p2 - p1;            // direction vector
+
+    double dx = v[0];
+    double dy = v[1];
+
+    double x1 = p1[0];
+    double y1 = p1[1];
+
+    // Quadratic coefficients
+    double A = dx*dx + dy*dy;
+    double B = 2.0 * (x1*dx + y1*dy);
+    double C = x1*x1 + y1*y1 - 1.0;
+
+    double disc = B*B - 4.0*A*C;
+    if (disc < 0.0 || A == 0.0) {
+        return CGLA::Vec2d(0.0, 0.0);  // No real intersection
+    }
+
+    double sqrtDisc = std::sqrt(disc);
+
+    // Two roots
+    double t1 = (-B - sqrtDisc) / (2.0 * A);
+    double t2 = (-B + sqrtDisc) / (2.0 * A);
+
+    // We want the smallest t > 0
+    double t = std::numeric_limits<double>::infinity();
+    if (t1 > 0.0 && t1 < t) {
+      t = t1;
+    }
+    if (t2 > 0.0 && t2 < t) {
+      t = t2;
+    }
+
+    if (!std::isfinite(t)) {
+        return CGLA::Vec2d(0.0, 0.0); // Intersection is behind p1
+    }  
+
+    return p1 + v * t;
+}
+
+/* ----------------------------------------------------------------------- *
+ * Given the 3D position of a vertex v_pos, which is actually only 2D, because the y-coordinate is zero (x, 0.0, y),
+ * find out which triangle face in the parameterized patch that contains the point p with coordinates (u,v). 
+ * The function returns the vertices of the face, and the bary centric coordinates (u, v, w).
+ * ----------------------------------------------------------------------- */
+void HarmonicMap::vertex_to_bary(Vec3d v_pos, VertexID& va, VertexID& vb, VertexID& vc, double& u, double& v, double& w) {
+  Matrix<double, 1, 3> p;
+  p << v_pos[0], v_pos[1], v_pos[2];
+  VectorXd bary_coords;
+  VectorXi vertex_ids;
+  find_barycentric_coords(p, V, F, bary_coords, vertex_ids);
+
+  va = igl_vertex_map.find(vertex_ids(0))->second;
+  vb = igl_vertex_map.find(vertex_ids(1))->second;
+  vc = igl_vertex_map.find(vertex_ids(2))->second;
+
+  u = bary_coords(0);
+  v = bary_coords(1);
+  w = bary_coords(2);
+}
 
 
+
+/* ----------------------------------------------------------------------- *
+ * The purpose of this function is to compute the 3D position of a given a 2D point with coordinates (u,v), 
+ * based on the Harmonic Map parameterization of the mesh
+ * ----------------------------------------------------------------------- */
+Vec3d HarmonicMap::uv_to_vertex(Vec2d v_uv) {
+
+  Matrix<double, 1, 2> p;
+  p << v_uv[0], v_uv[1];
+  VectorXd bary_coords;
+  VectorXi vertex_ids;
+
+  int face_id = find_barycentric_coords(p, V_uv, F, bary_coords, vertex_ids);
+
+  double x, y, z; 
+
+  if(face_id != -1) {
+
+    int va, vb, vc;
+    double alpha, beta, gamma;
+
+    va = vertex_ids(0);
+    vb = vertex_ids(1);
+    vc = vertex_ids(2);
+
+    alpha = bary_coords(0);
+    beta = bary_coords(1);
+    gamma = bary_coords(2);
+
+
+    x = alpha * V(va, 0) + beta * V(vb, 0) + gamma * V(vc,0);
+    y = alpha * V(va, 1) + beta * V(vb, 1) + gamma * V(vc,1);
+    z = alpha * V(va, 2) + beta * V(vb, 2) + gamma * V(vc,2);
+
+    return Vec3d(x, y, z);
+
+  }
+  else {
+
+    // Find the Edge intersection
+    auto edge_id_intersection = find_bd_edge_intersection(v_uv);
+
+    // Find the vertices of the boundary face
+    auto v1 = bd_F_vertices(edge_id_intersection, 0);
+    auto v2 = bd_F_vertices(edge_id_intersection, 1);
+    auto v3 = bd_F_vertices(edge_id_intersection, 2);
+
+    // Find the length of the edge in radiance
+    double alpha = atan2(V_uv(v1, 1), V_uv(v1, 0));
+    alpha = std::fmod(alpha + 2.0 * M_PI, 2.0 * M_PI);
+
+    double beta;
+    if (edge_id_intersection == bd_F_vertices.rows() - 1) {
+        beta = 2.0 * M_PI;
+    }
+    else {
+        beta = atan2(V_uv(v2, 1), V_uv(v2, 0));
+        beta = std::fmod(beta + 2.0 * M_PI, 2.0 * M_PI);
+    }
+
+    double edge_rad_length = beta - alpha;
+
+    // Find the intersection between the third vertex and the v_uv point
+    CGLA::Vec2d intersection_p = intersectRayWithUnitCircle(CGLA::Vec2d(V_uv(v3, 0), V_uv(v3,1)), v_uv);
+
+    // The intersection point in radians
+    double rad_length_intersection_p = atan2(intersection_p[1], intersection_p[0]);
+    rad_length_intersection_p = std::fmod(rad_length_intersection_p + 2.0 * M_PI, 2.0 * M_PI);
+
+    double t = (rad_length_intersection_p - alpha) / edge_rad_length;
+    
+    Vec3d v_pos_1 = Vec3d(V(v1,0),V(v1,1),V(v1,2));
+    Vec3d v_pos_2 = Vec3d(V(v2,0),V(v2,1),V(v2,2));
+
+    auto bd_v_ext_disp = (1.0 - t) * v_pos_1 + t * v_pos_2;
+
+    auto v_pos_3 = Vec3d(V(v3,0),V(v3,1),V(v3,2));
+
+    // Compute the proportional distance from v3 to v_uv
+    double s = length(v_uv - CGLA::Vec2d(V_uv(v3, 0), V_uv(v3, 1))) / length(intersection_p - CGLA::Vec2d(V_uv(v3, 0), V_uv(v3, 1)));
+
+    Vec3d v_pos = (1.0 - s) * v_pos_3 + s * bd_v_ext_disp;
+
+    return v_pos;
+  }
+  return Vec3d(x, y, z);
+}
+
+/* ----------------------------------------------------------------------- *
+ * The purpose of this function is to compute a basis centered at the 3D location of a vertex on the boundary of the patch.
+ * The z-axis is the normalized patch normal, the y-axis is given as the vector from the boundary point to the 
+ * ----------------------------------------------------------------------- */
+Mat3x3d HarmonicMap::get_patch_frame(Vec3d bd_pt) {
+
+  Vec3d y_vec = normalize(patch_centre - bd_pt);
+  Vec3d z_vec = normalize(patch_normal);
+  y_vec -= dot(z_vec,y_vec)*z_vec;
+  y_vec = normalize(y_vec);
+  Vec3d x_vec = normalize(cross(y_vec, z_vec));
+  Mat3x3d patch_frame = Mat3x3d(x_vec, y_vec, z_vec);
+  return patch_frame;
+}
+
+/* ----------------------------------------------------------------------- *
+ * The purpose of this function is to find the index of the boundary edge of the mesh,
+ * which intersects the line segment between the origin of the parameterized mesh
+ * and the 2D point with coordinates (u,v)
+ * ----------------------------------------------------------------------- */
+int HarmonicMap::find_bd_edge_intersection(Vec2d uv) {
+
+  for(int i = 0; i < bnd_uv.rows(); i++) {
+
+    int curr_index = i;
+    int next_index = (i+1)%bnd_uv.rows();
+
+    Matrix <double, 1, 3> p;
+    Matrix <double, 1, 3> r;
+    Matrix <double, 1, 3> q;
+    Matrix <double, 1, 3> s;
+
+    p << uv[0], uv[1], 0.0;
+    r << 0.0, 0.0, 0.0;
+
+    q << bnd_uv(i, 0), bnd_uv(i, 1), 0.0;
+    s << bnd_uv(next_index, 0), bnd_uv(next_index, 1), 0;
+
+    double t, u;
+
+    if(igl::segment_segment_intersect(p, r - p, q, s - q, t, u)) {
+
+      return i;
+    }
+
+  }
+  return -1;
+}
+
+/* ----------------------------------------------------------------------- *
+ * The purpose of this function is to compute the 3D displacement vector of a 2D point
+ * with coordinates (u,v) in the paramterized patch
+ * ----------------------------------------------------------------------- */
+Vec3d HarmonicMap::interp_disp_vec_extended(Vec2d v_uv, Vec3d source_pt) {
+  // The vector which we return
+  CGLA::Vec3d v_ext_disp;
+
+  int va, vb, vc;
+  double u, v, w;
+
+  // Find the barycentric coordinates and the vertices of the triangle
+  Matrix<double, 1, 2> p;
+  p << v_uv[0], v_uv[1];
+
+  VectorXd bary_coords;
+  VectorXi vertex_ids;
+  int face_id = find_barycentric_coords(p, V_uv, F, bary_coords, vertex_ids);
+
+  // The v_uv point is inside a triangle face on the source patch
+  if (face_id != -1) {
+
+    va = vertex_ids(0);
+    vb = vertex_ids(1);
+    vc = vertex_ids(2);
+
+    u = bary_coords(0);
+    v = bary_coords(1);
+    w = bary_coords(2);
+
+    Vec3d v_ext_a = Vec3d(V_ext(va,0),V_ext(va,1),V_ext(va,2))  - source_pt;
+    Vec3d v_ext_b = Vec3d(V_ext(vb,0),V_ext(vb,1),V_ext(vb,2))  - source_pt;
+    Vec3d v_ext_c = Vec3d(V_ext(vc,0),V_ext(vc,1),V_ext(vc,2))  - source_pt;
+
+    v_ext_disp = u*v_ext_a + v*v_ext_b + w*v_ext_c;
+
+  }
+  // The point is not inside a triangle face on the source patch, so we need to find the intersection between the line segment from (0,0) to (u,v), 
+  // and an edge on the boundary of the mesh. We then interpolate the displacement vectors.
+  else {
+
+    auto edge_id_intersection = find_bd_edge_intersection(v_uv);
+
+    // Find the vertices of the boundary face
+    auto v1 = bd_F_vertices(edge_id_intersection, 0);
+    auto v2 = bd_F_vertices(edge_id_intersection, 1);
+    auto v3 = bd_F_vertices(edge_id_intersection, 2);
+
+    // Find the length of the edge in radiance
+    double alpha = atan2(V_uv(v1, 1), V_uv(v1, 0));
+    alpha = std::fmod(alpha + 2.0 * M_PI, 2.0 * M_PI);
+
+    double beta;
+    if (edge_id_intersection == bd_F_vertices.rows() - 1) {
+        beta = 2.0 * M_PI;
+    }
+    else {
+        beta = atan2(V_uv(v2, 1), V_uv(v2, 0));
+        beta = std::fmod(beta + 2.0 * M_PI, 2.0 * M_PI);
+    }
+
+    double edge_rad_length = beta - alpha;
+
+    // Find the intersection between the third vertex and the v_uv point
+    CGLA::Vec2d intersection_p = intersectRayWithUnitCircle(CGLA::Vec2d(V_uv(v3, 0), V_uv(v3,1)), v_uv);
+
+    // The intersection point in radians
+    double rad_length_intersection_p = atan2(intersection_p[1], intersection_p[0]);
+    rad_length_intersection_p = std::fmod(rad_length_intersection_p + 2.0 * M_PI, 2.0 * M_PI);
+
+    double t = (rad_length_intersection_p - alpha) / edge_rad_length;
+    
+    Vec3d v_ext_1 = Vec3d(V_ext(v1,0),V_ext(v1,1),V_ext(v1,2))  - source_pt;
+    Vec3d v_ext_2 = Vec3d(V_ext(v2,0),V_ext(v2,1),V_ext(v2,2))  - source_pt;
+
+    auto bd_v_ext_disp = (1.0 - t) * v_ext_1 + t * v_ext_2;
+
+    auto v3_ext_disp = Vec3d(V_ext(v3,0),V_ext(v3,1),V_ext(v3,2))  - source_pt;
+
+    // Compute the proportional distance from v3 to v_uv
+    double s = length(v_uv - CGLA::Vec2d(V_uv(v3, 0), V_uv(v3, 1))) / length(intersection_p - CGLA::Vec2d(V_uv(v3, 0), V_uv(v3, 1)));
+
+    v_ext_disp = (1.0 - s) * v3_ext_disp + s * bd_v_ext_disp;
+  }
+  return v_ext_disp;
+}
+
+/* ----------------------------------------------------------------------- *
+ * The purpose of this function is to find the 2D coordinates (u,v) of a vertex with vertex-id (v)
+ * in the paramterized patch. Since the vertex was there, when the paramterization was computed,
+ * it should always have corresponding 2D (u,v) coordinates.
+ * ----------------------------------------------------------------------- */
+Vec2d HarmonicMap::patch_vertex_uv(VertexID v) {
+  int igl_v = -1;
+  if(vertex_igl_map.find(v) != vertex_igl_map.end()) {
+    igl_v = vertex_igl_map.find(v)->second;
+  }
+
+  if(igl_v != -1) {
+    return Vec2d(V_uv(igl_v, 0), V_uv(igl_v, 1));
+  }
+  else {
+    cout<<"ISSUEEE"<<endl;
+    return Vec2d(100, 100);
+  }
+}
+
+/* ----------------------------------------------------------------------- *
+ * Compute the Harmonic Map of a mesh (m) given a set of faces (patch_faces) with disk topology,
+ * and vertex with vertex-id (ref_v) for determining the orientation of the harmonic map
+ * The string extrusion_name is just included for debugging purposes.
+ * ----------------------------------------------------------------------- */
 void HarmonicMap::init_HarmonicMap(HMesh::Manifold m, HMesh::FaceSet patch_faces, HMesh::VertexID ref_v, std::string extrusion_name) {
 
   bd_v = ref_v;
@@ -85,12 +441,6 @@ void HarmonicMap::init_HarmonicMap(HMesh::Manifold m, HMesh::FaceSet patch_faces
     m.remove_face(f);
   }
 
-  /*
-  cout << "Saving the mesh inside init_HarmonicMap as: mesh_" << extrusion_name << ".obj" << endl;
-  cout.flush();
-  obj_save("mesh_" + extrusion_name + ".obj", m);
-  */
-
   // -------------------------
   // Split patch faces
   // -------------------------
@@ -114,19 +464,6 @@ void HarmonicMap::init_HarmonicMap(HMesh::Manifold m, HMesh::FaceSet patch_faces
   for (auto f : m.faces()) {
     patch_faces.insert(f);
   }
-
-  /*
-  cout << "Saving the mesh inside init_HarmonicMap as: mesh_after_split_" << extrusion_name << ".obj" << endl;
-  cout.flush();
-  obj_save("mesh_after_split_" + extrusion_name + ".obj", m);
-
-  cout << "After splitting the faces, how many are there: " << patch_faces.size(); 
-  cout << "Are they all in use: " << endl;
-  for (auto f : patch_faces) {
-    cout << "f: " << f << " is in use: " << m.in_use(f) << endl;
-  }
-  cout.flush();
-  */
 
   // -------------------------
   // Compute the boundary vertices
@@ -156,8 +493,6 @@ void HarmonicMap::init_HarmonicMap(HMesh::Manifold m, HMesh::FaceSet patch_faces
     vertex_igl_map.insert(std::make_pair(v, v_counter));
     igl_vertex_map.insert(std::make_pair(v_counter, v));
 
- 
-
     V(v_counter, 0) = m.pos(v)[0];
     V(v_counter, 1) = m.pos(v)[1];
     V(v_counter, 2) = m.pos(v)[2];
@@ -165,7 +500,6 @@ void HarmonicMap::init_HarmonicMap(HMesh::Manifold m, HMesh::FaceSet patch_faces
     v_counter++;
   }
 
-  
 
   // Face counter
   int f_counter = 0;
@@ -184,11 +518,9 @@ void HarmonicMap::init_HarmonicMap(HMesh::Manifold m, HMesh::FaceSet patch_faces
   }
 
   // find boundary vertices
-  //cout << "Printing the boundary vertices: " << endl;
   VectorXi bnd(bd_vertices.size());
   int i = 0;
   for (auto v : bd_vertices) {
-    //cout << "v: " << v << " m.pos(v): " << m.pos(v) << " V.row(i): " << V.row(vertex_igl_map.find(v)->second) << endl;
     bnd(i) = vertex_igl_map.find(v)->second;
     i++;
   }
@@ -200,16 +532,11 @@ void HarmonicMap::init_HarmonicMap(HMesh::Manifold m, HMesh::FaceSet patch_faces
 
   igl::map_vertices_to_circle(V,bnd,bnd_uv);
 
-  //cout << "bnd: " << bnd << endl;
-  //cout << "bnd_uv: " << bnd_uv << endl;
-
   igl::harmonic(V, F,bnd,bnd_uv,1,V_uv); // The original one
   bool hasNaN = V_uv.array().isNaN().any();
   if (hasNaN) {
     igl::harmonic(F,bnd,bnd_uv,1,V_uv);
   }
-  //
-  //V_uv = compute_intrinsic_harmonic_map(F, V, bnd, bnd_uv);
 
   std::map<HMesh::VertexID, CGLA::Vec2d> v_uv_map;
 
@@ -238,21 +565,6 @@ void HarmonicMap::init_HarmonicMap(HMesh::Manifold m, HMesh::FaceSet patch_faces
     bd_F_counter++;
   }
 
-  /*
-  cout << "V: " << endl;
-  for (int ii = 0; ii < V.rows(); ii++) {
-    cout << "[" << V(ii,0) << "," << V(ii,1) << "," << V(ii,2) << "]," << endl;
-  }
-  
-  cout << "F: " << endl;
-  for (int ii = 0; ii < F.rows(); ii++) {
-    cout << "[" << F(ii,0) << "," << F(ii,1) << "," << F(ii,2) << "]," << endl;
-  }
-
-  cout << "V_uv: " << V_uv << endl;
-  cout.flush();
-  */
-
   // ------------------------------------------
   // Save the extrusion mesh
   // ------------------------------------------
@@ -264,8 +576,6 @@ void HarmonicMap::init_HarmonicMap(HMesh::Manifold m, HMesh::FaceSet patch_faces
       }
     }
 
-    //obj_save(("pre_" + extrusion_name + ".obj"), m);
-
     for (auto v : m.vertices()) {
       if (vertex_igl_map.find(v) == vertex_igl_map.end()) {
         continue;
@@ -275,15 +585,10 @@ void HarmonicMap::init_HarmonicMap(HMesh::Manifold m, HMesh::FaceSet patch_faces
         m.pos(v) = Vec3d(V_uv(igl_v, 0), 0.0, V_uv(igl_v, 1));
       }
     }
-    //cout << "Saving the mesh as: " << extrusion_name << endl;
-    //cout.flush();
-    //obj_save(extrusion_name + ".obj", m);
   }
 
 
   // TC: Change 16th of June 2025
-  //cout << "About to set the patch_centre " << endl;
-  //cout.flush();
   patch_centre = uv_to_vertex(Vec2d(0.0));
 
   centre_face_id = uv_to_face(Vec2d(0.0));
@@ -299,32 +604,33 @@ void HarmonicMap::init_HarmonicMap(HMesh::Manifold m, HMesh::FaceSet patch_faces
     patch_normal[2] += N_faces(j,2);
   }
 
-
   patch_normal /= N_faces.rows();
   patch_normal = normalize(patch_normal);
 
 }
 
-void HarmonicMap::recompute_HarmonicMap(HMesh::Manifold m_old, HMesh::FaceSet patch_faces, HMesh::VertexID ref_v, int extrusion_id) {  //:  m(m), patch_faces(patch_faces) {
-
-  //cout << "Recomputing harmonic_map for extrusion: " << to_string(extrusion_id) << endl;
+/* ----------------------------------------------------------------------- *
+ * An overloaded function which recomputes the Harmonic Map 
+ * ----------------------------------------------------------------------- */
+void HarmonicMap::recompute_HarmonicMap(HMesh::Manifold m, HMesh::FaceSet patch_faces, HMesh::VertexID ref_v, int extrusion_id) {
 
   std::string extrusion_name = "recomputing_harmonic_map_" + to_string(extrusion_id);
   
-  HMesh::Manifold m = m_old; 
-  init_HarmonicMap(m, patch_faces, ref_v, extrusion_name);
-
-}
-
-HarmonicMap::HarmonicMap(HMesh::Manifold m_old, HMesh::FaceSet patch_faces, HMesh::VertexID ref_v, string extrusion_name) {  //:  m(m), patch_faces(patch_faces) {
-
-  HMesh::Manifold m = m_old;
   init_HarmonicMap(m, patch_faces, ref_v, extrusion_name);
 }
 
-HarmonicMap::HarmonicMap(HMesh::Manifold m_old, HMesh::FaceSet patch_faces, HMesh::FaceID centre_face, HMesh::FaceID right_face) {  //:  m(m), patch_faces(patch_faces) {
+/* ----------------------------------------------------------------------- *
+ * Also an overloaded function which recomputes the Harmonic Map 
+ * ----------------------------------------------------------------------- */
+HarmonicMap::HarmonicMap(HMesh::Manifold m, HMesh::FaceSet patch_faces, HMesh::VertexID ref_v, string extrusion_name) {  
 
-  HMesh::Manifold m = m_old;
+  init_HarmonicMap(m, patch_faces, ref_v, extrusion_name);
+}
+
+/* ----------------------------------------------------------------------- *
+ * Another function which takes other arguments but also computes the Harmonic Map
+ * ----------------------------------------------------------------------- */
+HarmonicMap::HarmonicMap(HMesh::Manifold m, HMesh::FaceSet patch_faces, HMesh::FaceID centre_face, HMesh::FaceID right_face) {  
 
   //find ref v
   HalfEdgeID bd_h = InvalidHalfEdgeID;
