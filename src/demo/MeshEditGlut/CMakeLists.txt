@@ -1,14 +1,16 @@
 cmake_minimum_required(VERSION 3.30)
 project(MeshEditGlutGEL)
-set(CMAKE_FIND_FRAMEWORK NEVER)
+#set(CMAKE_FIND_FRAMEWORK NEVER)
 set(CMAKE_CXX_STANDARD 20)
 include_directories(../..)
 
 # Locate the GEL library
-find_library(GEL_LIB GEL PATHS ../../../../build)
+#find_library(GEL_LIB GEL PATHS ../../../../build)
 find_package (OpenGL REQUIRED)
 find_package (GLUT REQUIRED)
 find_package (Threads REQUIRED)
+link_directories(../../../../build)
 
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 add_executable(glut_main glut_main.cpp)
-target_link_libraries(glut_main ${GEL_LIB} OpenGL::GL OpenGL::GLU GLUT::GLUT Threads::Threads)
+target_link_libraries(glut_main GEL OpenGL::GL OpenGL::GLU GLUT::GLUT Threads::Threads)
