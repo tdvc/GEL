@@ -213,6 +213,10 @@ public:
     
 
     HarmonicMap() {};
+
+
+
 };
+
 
 #endif /* defined(__MeshEditE__RadialMap__) */
