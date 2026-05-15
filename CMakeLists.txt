@@ -99,6 +99,8 @@ endif ()
 # Locate the sources for PyGEL
 file(GLOB_RECURSE PYG_SRC_LIST ./src/PyGEL/*.cpp)
 
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/src/demo)
+
 # Define the PyGEL library. Again two versions depending on use of GLGraphics
 if (Use_GLGraphics)
     add_library(PyGEL SHARED ${PYG_SRC_LIST})
