@@ -20,6 +20,10 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Darwin")
     set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64" CACHE STRING "Build architectures for MacOS" FORCE)
 endif ()
 
+# Eigen library
+find_package(Eigen3 3.3 REQUIRED)
+include_directories(${EIGEN3_INCLUDE_DIR})
+
 option(Use_GLGraphics "Compile the OpenGL Viewer" ON)
 if (Use_GLGraphics)
     find_package(OpenGL REQUIRED)
