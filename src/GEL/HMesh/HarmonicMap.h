@@ -23,9 +23,12 @@
 
 class HarmonicMap
 {
-
+    // Matrices to store: 
+    // V: Vertex positions in 3D
+    // V_uv: Harmonic coordinates in 2D
+    // V_ext: 3D positions of vertices
+    // bnd_uv: Harmonic coordinates of boundary vertices of the mesh with disk topology
     Eigen::MatrixXd V, V_uv, V_ext, bnd_uv, N_faces;
-  //(patch_vertices.size(), 3);
     Eigen::MatrixXi F; //(patch_faces.size()*2, 3);
     Eigen::MatrixXd F_centres;
     Eigen::MatrixXi bd_F_vertices; // Matrix storing the vretices of the boundary faces
@@ -164,8 +167,6 @@ public:
     std::map<HMesh::VertexID, CGLA::Vec2d> vertex_uv_map(HMesh::Manifold m,  std::string extrusion_name, bool save_extrusion);
 
     std::map<HMesh::VertexID, CGLA::Vec2d> compute_normal_harmonic_map_with_face_loop(HMesh::Manifold m, std::string extrusion_name, bool save_extrusion, HMesh::VertexID new_bd_v);
-
-    std::map<HMesh::VertexID, CGLA::Vec2d> compute_normal_harmonic_map_with_face_loop_from_triangle_faces(HMesh::Manifold m, std::string extrusion_name, bool save_extrusion, HMesh::VertexID new_bd_v);
 
     void rotate_uvs(Eigen::Vector3d src_v, Eigen::Vector3d tgt_v);
 
