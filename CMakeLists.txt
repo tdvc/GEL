@@ -29,7 +29,8 @@ FetchContent_Declare(
     GIT_TAG v2.6.0 # or another specific release/tag/commit
 )
 FetchContent_MakeAvailable(libigl)
-
+set(LIBIGL_WITH_TRIANGLE ON)
+set(LIBIGL_WITH_CGAL ON CACHE BOOL "Enable CGAL in libigl")
 
 # Eigen library
 find_package(Eigen3 3.3 REQUIRED)
