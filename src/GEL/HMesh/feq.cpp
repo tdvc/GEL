@@ -4,6 +4,171 @@
 #include "face_loop.h"
 #include "HarmonicMap.h"
 
+using namespace std;
+using namespace CGLA;
+using namespace Geometry;
+using namespace HMesh;
+using namespace Eigen;
+
+
+// TC: Basically, this function checks, whether the face-loop of h1 is alligned to the face-loop of h2. The two face-loops are alligned, 
+// if every face in loop 1 has a neighbour in loop2 and vice versa. 
+// If we start with h_begin = 1461 on a body of the DFAUST data set, it will be clear, that this function will evaluate to false in the for-loop below, 
+// because not every face of h2 face-loop will be neighbour to a face of h1 face-loop
+bool aligned_face_loop(Manifold &m, HalfEdgeID h1, HalfEdgeID h2) {
+
+//fix aligned face loop.
+
+    // TC: In order for a two faces-loops to be aligned, the face-loop of h1 should not contain any faces of the faces from the face-loop of h2
+    // Otherwise h2's face-loop intersects h1's face-loop, and this is what Karran checks here.
+    if(intersect_face_loop(m, h1, h2)) {
+      return false;
+    }
+
+    // TC: For this function, Karran traces out the faces in the face-loop of an edge - e.g. edge h1. 
+    // For each face f in the face-loop Karran checks, whether the face above f_above it or the face below it f_below are also part of the face-lop.
+    // If f_above or f_below are also in the face-loop, then the face-loop is self-adjacent and it is therefore definitely not alligned with the face-loop of h2.
+    if(self_adjacent(m, h1) || self_adjacent(m, h2)) {
+      return false;
+    }
+
+    // ----------------------------------------------------
+    // TC: In this part below Karran also checks, whether the face-loop of h2 (loop2) is alligned to the face-loop of h1 (loop1). 
+    // The faces of loop1 are called curr_faces. 
+    // Then Karran simply checks, whether every face in loop2 has a neighbour face that is part loop1 (named curr_faces)
+    // Because he does not know which direction to check, he checks for faces above loop2 and below loop2. If the face-loops do not allign,
+    // then there will be a case, where both a face above loop 2 and a face below loop 2 are not part of loop 1. They need both to be correct,
+    // because if only one face either above or below is correct, then it might just be the wrong direction
+    // ----------------------------------------------------
+    HalfEdgeAttributeVector<int> touched(m.no_halfedges(), 0);
+
+    FaceLoop loop1 = trace_face_loop(m, touched, h1);
+
+    FaceLoop loop2 = trace_face_loop(m, touched, h2);
+
+    FaceSet above_faces, curr_faces;
+
+    int above_flag = 0;
+    int below_flag = 0;
+
+    for(auto h : loop1.hvec) {
+        curr_faces.insert(m.walker(h).face());
+    }
+    for(auto h : loop2.hvec) {
+        HMesh::FaceID f = m.walker(h).face();
+        HMesh::FaceID above_face = m.walker(h).next().opp().face();
+        HMesh::FaceID below_face = m.walker(h).prev().opp().face();
+
+        if((curr_faces.find(above_face) == curr_faces.end()) && (curr_faces.find(below_face) == curr_faces.end()))
+             return false;
+    }
+
+    // If the two face-loops are aligned, we return true.
+    return true;
+}
+
+/* ----------------------------------------------------------------------- *
+ * TC: This function checks, whether a face-loop is self-adjacent. It basically means that for a face-loop on a FEQ-mesh, 
+ * if the neighbour face above a face in the face-loop, or a neighbour face below a face in the face-loop is also part of the face-loop
+ * then the face-loop is self-adjacent. If the face-loop is self-adjacent the set of face in the face-loop does not create a nice ring around
+ * the feature of the FEQ-mesh.
+ * ----------------------------------------------------------------------- */
+bool self_adjacent(HMesh::Manifold& m, HMesh::HalfEdgeID h) {
+  HalfEdgeAttributeVector<int> touched(m.no_halfedges(), 0);
+  FaceLoop curr_faceloop = trace_face_loop(m, touched, h);
+  FaceSet loop_faces;
+
+  for(auto h_loop : curr_faceloop.hvec) {
+    loop_faces.insert(m.walker(h_loop).face());
+  }
+
+  for(auto h_loop : curr_faceloop.hvec) {
+    HMesh::FaceID check_top = m.walker(h_loop).next().opp().face();
+    HMesh::FaceID check_bottom = m.walker(h_loop).prev().opp().face();
+
+    if(loop_faces.find(check_top) != loop_faces.end()) {
+      return true;
+    }
+
+    if(loop_faces.find(check_bottom) != loop_faces.end()) {
+      return true;
+    }
+
+  }
+  return false;
+}
+
+/* ----------------------------------------------------------------------- *
+ * If the function returns true, then the face-loop from h2 intersect the face-loop from h1.
+ * ----------------------------------------------------------------------- */
+bool intersect_face_loop(HMesh::Manifold &m, HMesh::HalfEdgeID h1, HMesh::HalfEdgeID h2) {
+   HalfEdgeAttributeVector<int> touched(m.no_halfedges(), 0);
+
+    FaceLoop loop1 = trace_face_loop(m, touched, h1);
+
+    FaceLoop loop2 = trace_face_loop(m, touched, h2);
+
+    HMesh::FaceSet above_faces, curr_faces;
+
+    int above_flag = 0;
+    int below_flag = 0;
+
+    for(auto h : loop1.hvec) {
+        curr_faces.insert(m.walker(h).face());
+    }
+
+    for(auto h : loop2.hvec) {
+        HMesh::FaceID f = m.walker(h).face();
+        if(curr_faces.find(f) != curr_faces.end())
+            return true;
+    }
+    return false;
+}
+
+/* ----------------------------------------------------------------------- *
+ * TC: The purpose of this function is the following. We check, whether the face-loop of edge h is the last face-loop we can decompose, because the next edge
+ * of h (m.walker(h).next().opp().next().halfedge()) points to a face, which is part of face set that becomes a base-patch of the face-loop (also called leaf). 
+ * The way that we check, whether the next edge points to a face, which is a base-patch and not a regular face-loop, is the following: 
+ * 1) We go through all edges in the face-loop of edge h. 
+ * 2) For each edge, we find the next edge, and this next edge is a part of a face-loop. The faces in this face-loop should intersect the face-loop of edge h. 
+ * If there is no self-intersection with face-loop of edge h, we need to check, whether the new-face loop is self-adjacent. If the face-loop is not self-adjacent, 
+ * then the faces cannot be a base-patch. Consequently, every face in the base-patch needs to either be part of a face-loop that intersects that last face-loop or be part of face-loop that
+ * is self-adjacent.
+ * ----------------------------------------------------------------------- */
+bool check_leaf(HMesh::Manifold& m, HMesh::HalfEdgeID h, int pos_flag) {
+
+    HMesh::HalfEdgeID curr_h = h;
+    HMesh::HalfEdgeID h_next, curr_h_next;
+
+    int leaf_flag = 0;
+
+    HMesh::HalfEdgeAttributeVector<int> touched(m.no_halfedges(), 0);
+
+    FaceLoop curr_faceloop = trace_face_loop(m, touched, curr_h);
+
+    for (auto h_iter : curr_faceloop.hvec) {
+        if(pos_flag == 0)
+            curr_h_next = m.walker(h_iter).next().opp().next().halfedge();
+        else
+            curr_h_next = m.walker(h_iter).prev().opp().prev().halfedge();
+
+        // It is a requirement that all faces in the next loop intersect the face-loop of edge h (also called curr_h), or that they are part of face-loop that intersects.
+        if(!intersect_face_loop(m, h_iter, curr_h_next)) {
+            leaf_flag = 1;
+        }
+
+        if(self_adjacent(m, curr_h_next)) {
+          leaf_flag = 0;
+        }
+    }
+
+    if(leaf_flag == 0) {
+        return true;
+    }
+    else {
+        return false;
+    }
+}
 
 
 /* ----------------------------------------------------------------------- *
@@ -11,7 +176,7 @@
  * a std::vector of edges instead of a boolean value. But it just keep going from one-face loop to another, as long
  * as the two face-loops are aligned.
  * ----------------------------------------------------------------------- */
-std::vector<HMesh::HalfEdgeID> find_face_loop_stack(Manifold &m, HMesh::HalfEdgeID curr_h, int pos_flag) {
+std::vector<HMesh::HalfEdgeID> find_face_loop_stack(HMesh::Manifold &m, HMesh::HalfEdgeID curr_h, int pos_flag) {
 
     HMesh::HalfEdgeID h_next;
     std::vector<HMesh::HalfEdgeID> feature_edges;
@@ -66,7 +231,7 @@ HMesh::FaceSet find_interior_faces(HMesh::Manifold &m, HMesh::HalfEdgeID h) {
         face_status[f] = 1;
     }
 
-    queue<HMesh::FaceID> fq;
+    std::queue<HMesh::FaceID> fq;
     HMesh::FaceID leaf_face = HMesh::InvalidFaceID;
     if(check_leaf(m, h, 0)) {
         leaf_face = m.walker(h_above).face();

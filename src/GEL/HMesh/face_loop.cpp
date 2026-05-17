@@ -65,7 +65,7 @@ namespace HMesh {
 
 
 
-    FaceLoop trace_face_loop(Manifold& m, HalfEdgeAttributeVector<int>& touched, HalfEdgeID h) {
+    FaceLoop trace_face_loop(HMesh::Manifold& m, HalfEdgeAttributeVector<int>& touched, HMesh::HalfEdgeID h) {
         auto comp_valency_imbalance = [](Manifold& m, Walker& w) {
             int val1 = valency(m, w.vertex());
             int val2 = valency(m, w.opp().vertex());
@@ -83,9 +83,9 @@ namespace HMesh {
 
         FaceLoop loop;
         FaceAttributeVector<int> path_faces_touched(0);
-        Vec3d avg_edge(0);
-        Vec3d center(0);
-        double avg_len = 0;
+        Vec3d avg_edge(0.0);
+        Vec3d center(0.0);
+        double avg_len = 0.0;
         do {
             touched[w.halfedge()] = 1;
             loop.area += area(m, w.face());
@@ -93,31 +93,37 @@ namespace HMesh {
                 loop.double_cross_faces.insert(w.face());
             path_faces_touched[w.face()] = 1;
             loop.hvec.push_back(w.halfedge());
+            loop.hset.insert(w.halfedge()); // Just the set of halfedges
             Vec3d p0 = m.pos(w.vertex());
             Vec3d p1 = m.pos(w.opp().vertex());
             Vec3d edg = (p0 - p1);
-            double edg_len = edg.length();
             center += p0 + p1;
             avg_edge += edg;
-            avg_len += edg_len;
+            avg_len += edg.length();
             int imbalance = comp_valency_imbalance(m, w);
             loop.valency_imbalance += imbalance;
             loop.integral_geodesic_curvature += geodesic_curvature(m,w);
+            w = w.next().next().opp();
             loop.min_len = min(loop.min_len, edg_len);
             double a = aspect(m, w.face());
             loop.min_aspect = min(loop.min_aspect, a);
             loop.mean_aspect += a;
-            w = w.next().next().opp();
         }
         while(w.halfedge() != h && !touched[w.halfedge()]);
+
         loop.cylindricity = length(avg_edge)/avg_len;
         loop.avg_edge = avg_edge;
         loop.avg_len = avg_len / loop.hvec.size();
         loop.center = center / (2.0 * loop.hvec.size());
         loop.integral_geodesic_curvature /= loop.area;
         loop.valency_imbalance /= loop.area;
-        loop.mean_aspect /= loop.hvec.size();
-    //    loop.cylindricity;// /= loop.area;
+        loop.cylindricity /= loop.area;
+
+        int perimeter_count = 0;
+
+        for (auto h : loop.hvec) {
+            loop.face_loop_faces.insert(m.walker(h).face());
+        }
 
         return loop;
     }

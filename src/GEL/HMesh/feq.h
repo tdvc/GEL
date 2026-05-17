@@ -212,28 +212,5 @@ public:
     HMesh::FaceSet get_base_face_set() {return base_face_set;}
 };
 
-/* ----------------------------------------------------------------------- *
- * Struct which stores all the data pertaining to a face loop
- * ----------------------------------------------------------------------- */
-struct FaceLoop {
-    std::vector<HMesh::HalfEdgeID> hvec;
-    HMesh::HalfEdgeSet hset;
-    HMesh::FaceSet double_cross_faces;
-    HMesh::FaceSet interior;
-    HMesh::FaceSet face_loop_faces; // TC: Added by TC
-    HMesh::VertexSet vertex_ring;
-    int interior_faces = 0;
-    double area = 0;
-    double avg_len = 0;
-    double interior_area = 0;
-    double cylindricity = 0;
-    double valency_imbalance = 0;
-    double integral_geodesic_curvature = 0;
-    double radius = 0.0;
-    double perimeter = 0.0;
-    CGLA::Vec3d avg_edge = CGLA::Vec3d(0,0,0);
-    CGLA::Vec3d center = CGLA::Vec3d(0,0,0);
-    int id=-1;
-};
 
 #endif

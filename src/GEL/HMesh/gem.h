@@ -25,5 +25,9 @@ std::vector<HMesh::VertexID> find_boundary_vertices(const HMesh::Manifold &m, HM
 
 std::vector<HMesh::HalfEdgeID> find_boundary_edges_from_ref_v(const HMesh::Manifold &m, HMesh::FaceSet patch_faces, HMesh::VertexID ref_v);
 
+double geodesic_curvature(HMesh::Manifold& m, HMesh::Walker& w);
+
+void smooth_faceset_lap_solve(HMesh::Manifold &m, HMesh::FaceSet faces);
+
 
 #endif /* gem_hpp */
