@@ -11,6 +11,9 @@ using namespace HMesh;
 using namespace Eigen;
 
 
+// A global variable
+std::map<int,Extrusion> extrusion_tree;
+
 // TC: Basically, this function checks, whether the face-loop of h1 is alligned to the face-loop of h2. The two face-loops are alligned, 
 // if every face in loop 1 has a neighbour in loop2 and vice versa. 
 // If we start with h_begin = 1461 on a body of the DFAUST data set, it will be clear, that this function will evaluate to false in the for-loop below, 

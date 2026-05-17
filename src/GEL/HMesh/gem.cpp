@@ -72,6 +72,18 @@ HMesh::HalfEdgeSet boundary_hes(const HMesh::Manifold &m, HMesh::FaceSet& fs) {
   return hsb;
 }
 
+/* ----------------------------------------------------------------------- *
+ * Find all edges in a face set
+ * ----------------------------------------------------------------------- */
+HMesh::HalfEdgeSet all_edges(const HMesh::Manifold& m, const HMesh::FaceSet& fs) {
+    HMesh::HalfEdgeSet hs;
+    for(auto f: fs)
+        circulate_face_ccw(m, f, [&](HalfEdgeID h) {
+            hs.insert(h);
+        });
+    return hs;
+}
+
 
 /* ----------------------------------------------------------------------- *
  * Purpose of function: To compute how many vertices the polygonal face f consists of
@@ -167,7 +179,7 @@ MatrixXd patch_laplacian_matrix(HMesh::Manifold &m, HMesh::VertexSet verts) {
    ArrayXXd A = ArrayXXd::Zero(num_verts,num_verts);
    Eigen::Triplet<double> T;
    std::vector<Eigen::Triplet<double>> triplet_list;
-   map<VertexID, int> vert_index;
+   std::map<HMesh::VertexID, int> vert_index;
    int interior_vert_index = 0;
    for(auto v : verts) {
      vert_index.insert(std::make_pair(v, interior_vert_index));
