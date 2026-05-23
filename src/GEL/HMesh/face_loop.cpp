@@ -97,6 +97,7 @@ namespace HMesh {
             Vec3d p0 = m.pos(w.vertex());
             Vec3d p1 = m.pos(w.opp().vertex());
             Vec3d edg = (p0 - p1);
+            double edg_len = edg.length();
             center += p0 + p1;
             avg_edge += edg;
             avg_len += edg.length();
@@ -128,7 +129,7 @@ namespace HMesh {
         return loop;
     }
 
-    vector<FaceLoop> find_face_loops(Manifold& m)
+    vector<FaceLoop> find_face_loops(HMesh::Manifold& m)
     {
         vector<FaceLoop> face_loops;
         HalfEdgeAttributeVector<int> touched(m.no_halfedges(), 0);

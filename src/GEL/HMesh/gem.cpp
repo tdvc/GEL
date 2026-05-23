@@ -25,6 +25,18 @@ HMesh::HalfEdgeSet all_edges(const HMesh::Manifold& m, const HMesh::FaceSet& fs)
     return hs;
 }
 
+ /* ----------------------------------------------------------------------- *
+  * For every face in the faceset (fs), find its halfedge and its opposite halfedge
+  * ----------------------------------------------------------------------- */
+HMesh::HalfEdgeSet extended_patch_edges(const HMesh::Manifold &m, HMesh::FaceSet& fs) {
+    HalfEdgeSet extend_patch_edges;
+    for (auto h : all_edges(m, fs)) {
+        extend_patch_edges.insert(h);
+        extend_patch_edges.insert(m.walker(h).opp().halfedge());
+    }
+    return extend_patch_edges;
+}
+
 /* ----------------------------------------------------------------------- *
  * Finds all the vertices of the set of faces (fs)
  * ----------------------------------------------------------------------- */
@@ -70,18 +82,6 @@ HMesh::HalfEdgeSet boundary_hes(const HMesh::Manifold &m, HMesh::FaceSet& fs) {
           hsb.insert(h);
   }
   return hsb;
-}
-
-/* ----------------------------------------------------------------------- *
- * Find all edges in a face set
- * ----------------------------------------------------------------------- */
-HMesh::HalfEdgeSet all_edges(const HMesh::Manifold& m, const HMesh::FaceSet& fs) {
-    HMesh::HalfEdgeSet hs;
-    for(auto f: fs)
-        circulate_face_ccw(m, f, [&](HalfEdgeID h) {
-            hs.insert(h);
-        });
-    return hs;
 }
 
 

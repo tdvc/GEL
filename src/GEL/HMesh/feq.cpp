@@ -10,17 +10,115 @@ using namespace Geometry;
 using namespace HMesh;
 using namespace Eigen;
 
-
 // A global variable
 std::map<int,Extrusion> extrusion_tree;
+
+MatrixXd patch_laplacian_coeff(HMesh::Manifold &m, HMesh::VertexSet verts) {
+
+  int num_verts = verts.size();
+  VertexSet bd_verts;
+
+  for (auto v: verts) {
+    //Eigen::Triplet<double> Tv (int(v.get_index()),int(v.get_index()), 1);
+    circulate_vertex_ccw(m,v, [&](VertexID vn){
+      if(verts.find(vn) == verts.end()) {
+        bd_verts.insert(vn);
+      }
+    });
+  }
+
+  MatrixXd bd_coords(bd_verts.size(),3);
+
+//  Matrix<double, Dynamic, 3> bd_coords;
+//  bd_coords.resize(bd_verts.size(),3);
+
+  map<VertexID, int> bd_vert_ids;
+  int bd_vert_index = 0;
+  for(auto v : bd_verts) {
+    bd_vert_ids.insert(std::make_pair(v, bd_vert_index));
+    bd_coords (bd_vert_index, 0) = m.pos(v)[0];
+    bd_coords (bd_vert_index, 1) = m.pos(v)[1];
+    bd_coords (bd_vert_index, 2) = m.pos(v)[2];
+//    Vector3d(m.pos(v)[0],m.pos(v)[1],m.pos(v)[2]);
+    bd_vert_index++;
+  }
+
+  map<VertexID, int> vert_ids;
+  int interior_vert_index = 0;
+  for(auto v : verts) {
+    vert_ids.insert(std::make_pair(v, interior_vert_index));
+    interior_vert_index++;
+  }
+
+
+  int num_bd_verts = bd_verts.size();
+
+  ArrayXXd A = ArrayXXd::Zero(num_verts, num_bd_verts);
+
+  //Eigen::SparseMatrix<double> A(num_verts,num_bd_verts);
+  Eigen::Triplet<double> T;
+  std::vector<Eigen::Triplet<double>> triplet_list;
+  std::vector<VertexID> bd_vertices;
+  for (auto v: verts) {
+    //Eigen::Triplet<double> Tv (int(v.get_index()),int(v.get_index()), 1);
+    int v_id_1 = vert_ids.find(v)->second;
+    //triplet_list.push_back(Tv);
+    circulate_vertex_ccw(m,v, [&](VertexID vn){
+      if(bd_verts.find(vn) != bd_verts.end()) {
+        bd_vertices.push_back(vn);
+        A(v_id_1, bd_vert_ids.find(vn)->second) = double(-1/double(valency(m,v)));
+        Eigen::Triplet<double> Tvn (v_id_1,bd_vert_ids.find(vn)->second,-1);
+        triplet_list.push_back(Tvn);
+      }
+    });
+  }
+
+  MatrixXd coeffs(num_bd_verts, 3);
+
+  coeffs = A.matrix()*bd_coords;
+
+  return coeffs;
+
+}
+
+/* ----------------------------------------------------------------------- *
+ * TC: This function checks, whether a face-loop is self-adjacent. It basically means that for a face-loop on a FEQ-mesh, 
+ * if the neighbour face above a face in the face-loop, or a neighbour face below a face in the face-loop is also part of the face-loop
+ * then the face-loop is self-adjacent. If the face-loop is self-adjacent the set of face in the face-loop does not create a nice ring around
+ * the feature of the FEQ-mesh.
+ * ----------------------------------------------------------------------- */
+bool self_adjacent(HMesh::Manifold& m, HMesh::HalfEdgeID h) {
+  HalfEdgeAttributeVector<int> touched(m.no_halfedges(), 0);
+  FaceLoop curr_faceloop = trace_face_loop(m, touched, h);
+  FaceSet loop_faces;
+
+  for(auto h_loop : curr_faceloop.hvec) {
+    loop_faces.insert(m.walker(h_loop).face());
+  }
+
+  for(auto h_loop : curr_faceloop.hvec) {
+    HMesh::FaceID check_top = m.walker(h_loop).next().opp().face();
+    HMesh::FaceID check_bottom = m.walker(h_loop).prev().opp().face();
+
+    if(loop_faces.find(check_top) != loop_faces.end()) {
+      return true;
+    }
+
+    if(loop_faces.find(check_bottom) != loop_faces.end()) {
+      return true;
+    }
+
+  }
+  return false;
+}
+
+
 
 // TC: Basically, this function checks, whether the face-loop of h1 is alligned to the face-loop of h2. The two face-loops are alligned, 
 // if every face in loop 1 has a neighbour in loop2 and vice versa. 
 // If we start with h_begin = 1461 on a body of the DFAUST data set, it will be clear, that this function will evaluate to false in the for-loop below, 
 // because not every face of h2 face-loop will be neighbour to a face of h1 face-loop
-bool aligned_face_loop(Manifold &m, HalfEdgeID h1, HalfEdgeID h2) {
-
-//fix aligned face loop.
+bool aligned_face_loop(HMesh::Manifold &m, HMesh::HalfEdgeID h1, HMesh::HalfEdgeID h2) {
 
     // TC: In order for a two faces-loops to be aligned, the face-loop of h1 should not contain any faces of the faces from the face-loop of h2
     // Otherwise h2's face-loop intersects h1's face-loop, and this is what Karran checks here.
@@ -70,36 +168,37 @@ bool aligned_face_loop(Manifold &m, HalfEdgeID h1, HalfEdgeID h2) {
     return true;
 }
 
+
 /* ----------------------------------------------------------------------- *
- * TC: This function checks, whether a face-loop is self-adjacent. It basically means that for a face-loop on a FEQ-mesh, 
- * if the neighbour face above a face in the face-loop, or a neighbour face below a face in the face-loop is also part of the face-loop
- * then the face-loop is self-adjacent. If the face-loop is self-adjacent the set of face in the face-loop does not create a nice ring around
- * the feature of the FEQ-mesh.
+ * In this function Karran basically checks, whether h is at the bottom of a single feature, which can be decomposed. 
  * ----------------------------------------------------------------------- */
-bool self_adjacent(HMesh::Manifold& m, HMesh::HalfEdgeID h) {
-  HalfEdgeAttributeVector<int> touched(m.no_halfedges(), 0);
-  FaceLoop curr_faceloop = trace_face_loop(m, touched, h);
-  FaceSet loop_faces;
+bool check_leaf_stack (Manifold& m, HalfEdgeID h, int pos_flag) {
 
-  for(auto h_loop : curr_faceloop.hvec) {
-    loop_faces.insert(m.walker(h_loop).face());
-  }
+    HalfEdgeID curr_h = h;
+    HalfEdgeID h_next, curr_h_next;
 
-  for(auto h_loop : curr_faceloop.hvec) {
-    HMesh::FaceID check_top = m.walker(h_loop).next().opp().face();
-    HMesh::FaceID check_bottom = m.walker(h_loop).prev().opp().face();
+    int leaf_flag = 0;
 
-    if(loop_faces.find(check_top) != loop_faces.end()) {
-      return true;
+    if(pos_flag == 0) {
+        h_next = m.walker(curr_h).next().opp().next().halfedge();
+    }
+    else {  
+        h_next = m.walker(curr_h).prev().opp().prev().halfedge();
     }
 
-    if(loop_faces.find(check_bottom) != loop_faces.end()) {
-      return true;
+    while(aligned_face_loop(m, curr_h, h_next)) {
+        curr_h = h_next;
+        if(pos_flag == 0)
+            h_next = m.walker(curr_h).next().opp().next().halfedge();
+        else
+            h_next = m.walker(curr_h).prev().opp().prev().halfedge();
     }
 
-  }
-  return false;
+    // In order to be a leaf, then every face in the leaf/base-patch should be part of a face-loop, which intersects the face-loop of curr_h or be a self-adjacent face-loop
+    return check_leaf(m, curr_h, pos_flag);
+
 }
+
 
 /* ----------------------------------------------------------------------- *
  * If the function returns true, then the face-loop from h2 intersect the face-loop from h1.
@@ -172,6 +271,137 @@ bool check_leaf(HMesh::Manifold& m, HMesh::HalfEdgeID h, int pos_flag) {
         return false;
     }
 }
+
+Hmesh::HalfEdgeID find_next_feature(Manifold& m, HalfEdgeID h, int pos_flag) {
+
+//    HalfEdgeSet feature_set;
+//    feature_set.insert(h);
+    std::queue<HalfEdgeID> feature_queue;
+    feature_queue.push(h);
+
+    vector<HalfEdgeID> feature_edges, unique_jns, leaf_edges;
+
+    HalfEdgeID curr_h;
+
+    while(!feature_queue.empty()) {
+
+        curr_h = feature_queue.front();
+        feature_edges = find_face_loop_stack(m, curr_h, pos_flag);
+ 
+
+        // ----------------------------------------
+        // TC: If feature_edges does not contain any edges, because the mesh is empty, 
+        // or if that last inserted edge into feature_edges (the one which could be a leaf extrusion) is actually not a leaf
+        // extrusion, then we need to run the find_unique_jns function, with the argument being the last edge, where the face-loops
+        // where alligned.
+        if(feature_edges.size() == 0) {
+//            feature_set.erase(curr_h_it);
+            feature_queue.pop();
+            continue;
+        }
+
+        if(check_leaf(m, feature_edges.back(), pos_flag)) {
+            leaf_edges.push_back(curr_h);
+//            feature_set.erase(curr_h_it);
+
+            feature_queue.pop();
+            continue;
+        }
+
+        unique_jns = find_unique_jns(m, feature_edges.back(), pos_flag);
+
+        //cout<<"found unique jns"<<endl;
+
+        int contains_flag = 0;
+        for (auto h_jn : unique_jns) {
+            //cout<<h_jn<<endl;
+ /**           contains_flag = 0;
+            for(auto h_set : feature_set)
+               if(check_contains(m, h_set, h_jn))
+                   contains_flag = 1;
+            if(contains_flag == 0) **/
+            feature_queue.push(h_jn);
+        }
+
+//        feature_set.erase(curr_h_it);
+        feature_queue.pop();
+    }
+
+    leaf_edges = filter_the_leaf_edges(m, leaf_edges, pos_flag);
+    
+
+    // ---------------------------------------
+    // TC: In the following we go through all the leaf edges, which we have detected in the code above. Each leaf-edge is on a feature, 
+    // and for each leaf-edge leaf_h we trace all the aligned face-loops above it and below it. With these face-loops we then compute a cylindiricty 
+    // measure, and then we dide that cylindiricty measure with the total number of face-loops. The leaf-edge with the biggest cylindiricty measure is then
+    // used and returned as the best_leaf_edge.
+    // Karran computes the curr_cyl in a strange way: He devides it by (1 + 10*avg_radius + 10*curr_face_loop.area), but I am not quite sure, why he does that?
+    // ---------------------------------------
+    //cout<<"Queue traversal done, checking leaves"<<endl;
+    FaceLoop curr_face_loop;
+    HalfEdgeAttributeVector<int> touched(m.no_halfedges(), 0);
+    float curr_cyl;
+    float eps = 1e-6;
+    float max_cyl = 0;
+    vector<HalfEdgeID> above_stack, below_stack;
+    HalfEdgeID best_leaf_edge;
+
+    for(auto leaf_h : leaf_edges) {//
+
+        //if(valency(m, m.walker(leaf_h).vertex()) != 4 || valency(m, m.walker(leaf_h).opp().vertex()) != 4)
+        //  continue;
+        curr_cyl = 0.0;
+        //cout<<leaf_h<<endl<<m.walker(leaf_h).opp().halfedge()<<endl;
+        if(leaf_h == InvalidHalfEdgeID) {
+            continue;
+        }
+        //curr_cyl = trace_face_loop(m, touched, curr_h).cylindricity;
+        above_stack = find_face_loop_stack(m, leaf_h, 0);//;
+
+        below_stack = find_face_loop_stack(m, leaf_h, 1);
+ 
+        for(auto stack_h : above_stack) {
+            //cout<<stack_h<<endl;
+            HalfEdgeAttributeVector<int> h_touched(m.no_halfedges(), 0);
+            curr_face_loop = trace_face_loop(m, h_touched, stack_h);
+            double avg_radius = 0.0;
+            for(auto loop_h : curr_face_loop.hvec)
+              avg_radius += length(curr_face_loop.center - m.pos(m.walker(loop_h).vertex()));
+            avg_radius /= curr_face_loop.hvec.size();
+
+            curr_cyl += curr_face_loop.cylindricity/(1 + 10*avg_radius + 10*curr_face_loop.area);
+            //curr_cyl += curr_face_loop.perimeter; //1.0/curr_face_loop.cylindricity; //curr_face_loop.perimeter; //curr_face_loop.radius / (1 + curr_face_loop.cylindricity); //curr_face_loop.cylindricity; ///(1 + 10*avg_radius + 10*curr_face_loop.area);
+
+        }
+        for(auto stack_h : below_stack) {
+        //cout<<stack_h<<endl;
+            HalfEdgeAttributeVector<int> h_touched(m.no_halfedges(), 0);
+            curr_face_loop = trace_face_loop(m, h_touched, stack_h);
+            double avg_radius = 0.0;
+            for(auto loop_h : curr_face_loop.hvec)
+              avg_radius += length(curr_face_loop.center - m.pos(m.walker(loop_h).vertex()));
+            avg_radius /= curr_face_loop.hvec.size();
+
+            curr_cyl += curr_face_loop.cylindricity/(1 + 10*avg_radius + 10*curr_face_loop.area);
+            //curr_cyl += curr_face_loop.perimeter; //1.0/curr_face_loop.cylindricity; //curr_face_loop.perimeter;//curr_face_loop.radius / (1 + curr_face_loop.cylindricity); //curr_face_loop.cylindricity; ///(1 + 10*avg_radius + 10*curr_face_loop.area);
+
+        }
+        if(abs(curr_cyl) > 1e-6) {
+            curr_cyl /= (above_stack.size() + below_stack.size());
+        }
+        //cout<<curr_cyl<<endl;
+
+        if(curr_cyl > max_cyl) {
+            max_cyl = curr_cyl;
+            best_leaf_edge = leaf_h;
+        }
+    }
+
+    //cout<<best_leaf_edge<<endl;
+    //cout<<"returning edge :"<<best_leaf_edge<<endl;
+    return best_leaf_edge;
+}
+
 
 
 /* ----------------------------------------------------------------------- *
@@ -511,9 +741,7 @@ void compute_new_bd_v_from_prev_ext(Extrusion &contrib_ext, Extrusion &next_ext)
     auto hmap = contrib_ext.hmap_stack.top();
     bool save_mesh = false;
     std::string extrusion_name = "ext_" + std::to_string(next_ext.id);
-    if (next_ext.id >= 100 && save_mesh_patches) {
-        save_mesh = true;
-    }
+
     //std::map<HMesh::VertexID, CGLA::Vec2d> vertex_uv_map = hmap.compute_harmonic_map_with_face_loop(contrib_ext.m_state_before, extrusion_name, save_mesh, correct_bd_v);
     HMesh::Manifold m = contrib_ext.m_state_before;
     smooth_faceset_lap_solve(m, contrib_ext.base_face_set);
