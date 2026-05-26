@@ -6,6 +6,7 @@
  * ----------------------------------------------------------------------- */
 
 #include "gem.h"
+#include "face_loop.h"
 #include <Eigen/Dense>
 #include <Eigen/Sparse>
 
@@ -167,74 +168,6 @@ std::vector<HMesh::HalfEdgeID> find_boundary_edges_from_ref_v(const HMesh::Manif
     return bd_edges_in_order;
 }
 
-
-HMesh::FaceSet find_interior_faces(HMesh::Manifold &m, HMesh::HalfEdgeID h) {
-
-//find which side is leaf
-//do the queue bfs thing
-//return the set
-   HalfEdgeAttributeVector<int> touched(m.no_halfedges(), 0);
-   FaceLoop l = trace_face_loop(m, touched, h);
-
-   FaceSet curr_faces, interior_faces;
-
-   for(auto h : l.hvec) {
-        curr_faces.insert(m.walker(h).face());
-   }
-
-    HalfEdgeID h_above;
-    HalfEdgeID h_below;
-
-    h_above = m.walker(h).next().opp().next().halfedge();
-    h_below = m.walker(h).prev().opp().prev().halfedge();
-
-
-    //find interior face set
-    FaceAttributeVector<int> face_status(m.no_faces(),0);
-    FaceAttributeVector<int> face_visited(m.no_faces(),0);
-
-
-    for(auto f : curr_faces) {
-        face_status[f] = 1;
-    }
-
-    queue<FaceID> fq;
-    FaceID leaf_face = InvalidFaceID;
-    if(check_leaf(m, h, 0)) {
-        leaf_face = m.walker(h_above).face();
-    }
-    else if(check_leaf(m,h,1)) {
-        leaf_face = m.walker(h_below).face();
-    }
-
-    fq.push(leaf_face);
-    face_visited[leaf_face] = 1;
-
-    int limit = 10000000;
-    int count = 0;
-
-
-    while(!fq.empty()) {
-        auto f = fq.front();
-        fq.pop();
-        interior_faces.insert(f);
-        FaceSet nb_faces;
-        circulate_face_ccw(m, f, [&](FaceID fn){
-            nb_faces.insert(fn);
-        });
-        for(auto fn : nb_faces) {
-          if(face_visited[fn] == 0 && face_status[fn] != 1 && interior_faces.find(fn) == interior_faces.end()) {
-            fq.push(fn);
-            face_visited[fn] = 1;
-          }
-        }
-    
-        count++;
-
-    }
-
-    return interior_faces;
-}
 
 // TC: The purpose of this function is the following: Sometimes it might happen, that the faces needed for an 
 // extrusion are actually disconnected. This is probably a consequence of the fact that we do not decompose 

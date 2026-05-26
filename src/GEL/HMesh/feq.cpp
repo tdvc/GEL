@@ -582,35 +582,6 @@ HMesh::HalfEdgeID find_next_feature(Manifold& m, HalfEdgeID h, int pos_flag) {
 }
 
 
-
-/* ----------------------------------------------------------------------- *
- * This function is the same as the check_leaf_stack function except for the fact that it returns
- * a std::vector of edges instead of a boolean value. But it just keep going from one-face loop to another, as long
- * as the two face-loops are aligned.
- * ----------------------------------------------------------------------- */
-std::vector<HMesh::HalfEdgeID> find_face_loop_stack(HMesh::Manifold &m, HMesh::HalfEdgeID curr_h, int pos_flag) {
-
-    HMesh::HalfEdgeID h_next;
-    std::vector<HMesh::HalfEdgeID> feature_edges;
-    feature_edges.push_back(curr_h);
-
-    if(pos_flag == 0)
-        h_next = m.walker(curr_h).next().opp().next().halfedge();
-    else
-        h_next = m.walker(curr_h).prev().opp().prev().halfedge();
-
-    while(aligned_face_loop(m, curr_h, h_next)) {
-        curr_h = h_next;
-        feature_edges.push_back(curr_h);
-        if(pos_flag == 0)
-            h_next = m.walker(curr_h).next().opp().next().halfedge();
-        else
-            h_next = m.walker(curr_h).prev().opp().prev().halfedge();
-    }
-
-    return feature_edges;
-}
-
 /* ----------------------------------------------------------------------- *
  * Given a HalfEdgeID h, this function traces the face-loop, which h is part of
  * and finds all faces that make up a patch above the face-loop. The direction of the 
@@ -677,6 +648,41 @@ HMesh::FaceSet find_interior_faces(HMesh::Manifold &m, HMesh::HalfEdgeID h) {
     return interior_faces;
 }
 
+
+/* ----------------------------------------------------------------------- *
+ * Split groups of faces into faces that belong to the base patch and faces that belong to the boundary loops
+ * In this way we can handle faces that need to be found on the previous extrusion
+ * ----------------------------------------------------------------------- */
+std::tuple<std::vector<HMesh::FaceSet>, std::vector<HMesh::FaceSet>, std::vector<std::pair<HMesh::FaceSet, bool>>> split_groups_of_faces(std::vector<HMesh::FaceSet> face_groups, HMesh::FaceSet base_face_set) {
+    std::vector<std::pair<HMesh::FaceSet, bool>> split_face_groups;
+    std::vector<FaceSet> face_loop_groups;
+    std::vector<FaceSet> base_patch_groups;
+
+    // True if it is base-patch faces, and false if it is face_loop faces
+
+    for (auto fg : face_groups) {
+        FaceSet base_patch_faces;
+        FaceSet face_loop_faces;
+        for (auto f : fg) {
+            if (base_face_set.find(f) != base_face_set.end()) {
+                base_patch_faces.insert(f);
+            }
+            else {
+                face_loop_faces.insert(f);
+            }
+        }
+        if (!base_patch_faces.empty()) {
+            split_face_groups.push_back(std::make_pair(base_patch_faces, true));
+            base_patch_groups.push_back(base_patch_faces);
+        }
+        if (!face_loop_faces.empty()) {
+            split_face_groups.push_back(std::make_pair(face_loop_faces, false));
+            face_loop_groups.push_back(face_loop_faces);
+        }
+    }
+
+    return {face_loop_groups, base_patch_groups, split_face_groups};
+}
 
 
 /* ----------------------------------------------------------------------- *
@@ -856,6 +862,24 @@ HMesh::FaceSet store_next_gen_extrusions_hmap(HMesh::Manifold &m, Extrusion& ext
       return fs;
 }
 
+void update_extrusion_element_with_bd_v(HMesh::Manifold &m, Extrusion & ext, HMesh::HalfEdgeID bd_h, CGLA::Vec2d bd_vs) {
+    extrusion_tree[ext.id].bd_h = bd_h;
+    extrusion_tree[ext.id].bd_v = m.walker(bd_h).vertex();
+    extrusion_tree[ext.id].bd_v_pos = m.pos(m.walker(bd_h).vertex());
+    extrusion_tree[ext.id].bd_vs = bd_vs;
+
+    std::stack<HarmonicMap> transform_stack = ext.hmap_stack;
+    auto new_HarmonicMap = transform_stack.top();
+    transform_stack.pop();
+    new_HarmonicMap.set_bd_h(bd_h);
+    new_HarmonicMap.set_bd_v(m.walker(bd_h).vertex());
+    new_HarmonicMap.recompute_HarmonicMap(ext.m_state, 
+                                                ext.base_face_set, 
+                                                m.walker(bd_h).vertex(), ext.id);
+    transform_stack.push(new_HarmonicMap);
+    extrusion_tree[ext.id].hmap_stack = transform_stack;
+}
+
 
 /* ----------------------------------------------------------------------- *
  * Update the next extrusion only based on one previous extrusion
@@ -941,22 +965,349 @@ void compute_new_bd_v_from_prev_ext(Extrusion &contrib_ext, Extrusion &next_ext)
 
 }
 
-void update_extrusion_element_with_bd_v(HMesh::Manifold &m, Extrusion & ext, HMesh::HalfEdgeID bd_h, CGLA::Vec2d bd_vs) {
-    extrusion_tree[ext.id].bd_h = bd_h;
-    extrusion_tree[ext.id].bd_v = m.walker(bd_h).vertex();
-    extrusion_tree[ext.id].bd_v_pos = m.pos(m.walker(bd_h).vertex());
-    extrusion_tree[ext.id].bd_vs = bd_vs;
+void compute_new_bd_v_from_partial_prev_ext(Extrusion & ext) {
 
-    std::stack<HarmonicMap> transform_stack = ext.hmap_stack;
-    auto new_HarmonicMap = transform_stack.top();
-    transform_stack.pop();
-    new_HarmonicMap.set_bd_h(bd_h);
-    new_HarmonicMap.set_bd_v(m.walker(bd_h).vertex());
-    new_HarmonicMap.recompute_HarmonicMap(ext.m_state, 
-                                                ext.base_face_set, 
-                                                m.walker(bd_h).vertex(), ext.id);
-    transform_stack.push(new_HarmonicMap);
-    extrusion_tree[ext.id].hmap_stack = transform_stack;
+    // A map to store which extrusions have which faces
+    std::map<int, HMesh::FaceSet> contrib_ext_face_sets;
+
+    HMesh::VertexSet boundary_vertices = boundary_verts(ext.m_state, ext.base_face_set);
+    HMesh::HalfEdgeSet boundary_edges = boundary_hes(ext.m_state, ext.base_face_set);
+    HalfEdgeSet patch_edges = extended_patch_edges(ext.m_state, ext.base_face_set);
+
+
+    double max_angle = 0.0;
+    HMesh::VertexID new_bd_v = HMesh::InvalidVertexID;
+    CGLA::Vec2d new_bd_vs;
+    int bd_vs_responsible_extrusion = -1;
+    std::vector<HMesh::FaceSet> bd_v_face_groups;
+    std::map<HMesh::VertexID, CGLA::Vec2d> bd_v_uv_map;
+
+    // Variables needed to ensure that the boundary vertex is from a face-set that comes from a base-patch
+    bool is_ref_v_already_set = false;
+    double cutoff = 1.5;
+
+    // Edge and face to store the boundary vertex
+    HMesh::HalfEdgeID bd_h;
+    HMesh::FaceID bd_f;
+    HMesh::FaceSet current_ref_v_face_set;
+    
+    // Find faces from all contributing extrusions
+    for (auto contrib_ext_id : ext.contributing_extrusions) {
+
+        //cout << "Investigating contributing extrusion with id: " << contrib_ext_id << endl;
+
+        auto contrib_ext = extrusion_tree[contrib_ext_id];
+
+        HMesh::Manifold m = contrib_ext.m_state_before;
+        HMesh::Manifold m_unsmoothed = contrib_ext.m_state_before;
+
+        // Find all the faces that belong to the contributing extrusion
+        HMesh::FaceSet base_face_set = contrib_ext.base_face_set;
+        HMesh::FaceSet full_face_set;
+        for(auto f : base_face_set)  {
+            full_face_set.insert(f);
+        }
+
+        for(auto f : contrib_ext.stack_faces) {
+            full_face_set.insert(f);
+        }
+
+        smooth_faceset_lap_solve(m, base_face_set);
+
+        //cout << "Fetching extrusion with id: " << contrib_ext.id << endl;
+        stack<HarmonicMap> transform_stack = contrib_ext.hmap_stack;
+        auto hmap = transform_stack.top();
+
+        std::map<int, HMesh::FaceSet> ext_face_sets;
+        auto extrusion_id = contrib_ext.extrusion_id;
+        for(auto f : full_face_set) {
+            if (extrusion_id[f] != -1) {
+                int curr_ext_id = extrusion_id[f];
+                if(ext_face_sets.find(curr_ext_id) != ext_face_sets.end()) {
+                    ext_face_sets.find(curr_ext_id)->second.insert(f);
+                }
+                else {
+                    FaceSet curr_fs;
+                    curr_fs.insert(f);
+                    ext_face_sets.insert(std::make_pair(curr_ext_id, curr_fs));
+                }
+            }
+        }
+
+        // --------------------------
+        // Find the correct boundary vertex, because we have selected the one after the extrusion is killed
+        // We cannot use contrib_ext.bd_v, because bd_v was found on contrib_ext.m_state and not on contrib_ext.m_state_before
+        // and thus bd_v might be different on contrib_ext.m_state_before than on contrib_ext.m_state. Consequently, we need to 
+        // use the boundary edge instead.
+        // --------------------------
+        HMesh::VertexSet temp_bd_verts = boundary_verts(m, base_face_set);
+        HMesh::VertexID correct_bd_v;
+        for (auto v : temp_bd_verts) {
+            circulate_vertex_ccw(m, v, [&] (HMesh::HalfEdgeID h) {
+                if (m.walker(h).vertex() == m.walker(contrib_ext.bd_h).vertex()) {
+                    correct_bd_v = v;
+                }
+            });
+        }
+
+        bool save_mesh = true;
+        std::string extrusion_name = "ext_" + std::to_string(contrib_ext.id);
+        //if (contrib_ext.id >= 0 && save_mesh_patches) {
+        //    save_mesh = true;
+        //}
+  
+        //std::map<HMesh::VertexID, CGLA::Vec2d> vertex_uv_map = hmap.compute_harmonic_map_with_face_loop(m, extrusion_name, save_mesh, correct_bd_v);
+        std::map<HMesh::VertexID, CGLA::Vec2d> vertex_uv_map = hmap.compute_normal_harmonic_map_with_face_loop(m, extrusion_name, save_mesh, correct_bd_v);
+
+        for(auto it = ext_face_sets.begin(); it != ext_face_sets.end(); it++) {
+            int next_ext_id = it->first;
+            FaceSet next_fs = it->second;
+
+            Extrusion next_ext = extrusion_tree.find(next_ext_id)->second;
+
+            // Only include the faces of the extrusion that matches ext 
+            if (next_ext.id == ext.id) {
+
+                auto groups_of_face_sets = find_groups_of_faces(m, next_fs);
+                auto [face_loop_groups, base_patch_groups, face_groups] = split_groups_of_faces(groups_of_face_sets, base_face_set);
+                
+                // If some of the face sets in face_groups come from the base-patch, where they are the result of previous face-loop faces that have been extruded, we need to detect that,
+                // because then they should be split up
+                // However, we should only split it them up, if we don't need the entire base-patch
+                // ------------------------------------------------------------------------------------------
+                bool use_entire_base_patch = ext.contributing_extrusions_entire_base_patch.find(contrib_ext.id)->second;
+                
+                /*
+                if (!use_entire_base_patch) {
+                    auto face_groups_copy = face_groups; 
+                    std::vector<HMesh::FaceSet> new_face_sets;
+                    std::set<int> face_groups_to_remove;
+                    for (int kk = 0; kk < face_groups.size(); kk++) {
+                        auto grouped_faces = group_f_loop_faces(face_groups[kk].first, f_loop_map, f_loop_counter, contrib_ext.id);
+
+                        cout << "Size of grouped_faces is: " << grouped_faces.size() << endl;
+                        for (auto new_fs : grouped_faces) {
+                            cout << "New face set: " << endl;
+                            for (auto f : new_fs.first) {
+                                cout << f << " ";
+                            }
+                            cout << endl;
+                        }
+
+                        f_loop_counter += 1;
+
+                        if (grouped_faces.size() > 1) {
+                            face_groups_to_remove.insert(kk);
+                            for (auto new_fs : grouped_faces) {
+                                new_face_sets.push_back(new_fs.first);
+                            }
+                        }
+                    }
+                    for (auto kk : face_groups_to_remove) {
+                        face_groups_copy.erase(face_groups_copy.begin() + kk);
+                    }
+                    for (auto new_fs : new_face_sets) {
+                        face_groups_copy.push_back(std::make_pair(new_fs, true));
+                    }
+                    face_groups.clear(); face_groups = face_groups_copy;
+
+
+                    cout << "face_groups after change: " << endl;
+                    for (auto faceset : face_groups) {
+                        for (auto f : faceset.first) {
+                            cout << f << " ";
+                        }
+                        cout << endl;
+                    }
+                    cout << endl;
+                }   
+                */
+                // ------------------------------------------------------------------------------------------
+
+                int index_of_bd_v_responsible_fs = -1;                
+
+
+                // Only use the base-patch groups to find the new boundary vertex, because since we cut the mesh, then this might be more accurate 
+                // than placing on the face-loop. However, if this group is empty, then we need to use the face-loop groups instead.
+                //for (auto faceset : ref_v_responsible_face_groups) {
+                for (int kk = 0; kk < face_groups.size(); kk++) {
+
+                    auto faceset = face_groups[kk].first;
+                    auto inside_base_patch = face_groups[kk].second;
+
+                    if ((is_ref_v_already_set || base_patch_groups.size() > 0) && !inside_base_patch) {
+                        continue;
+                    }
+                    // Change the cutoff
+                    if (inside_base_patch) {
+                        cutoff = 0.7;
+                        is_ref_v_already_set = false;
+                    }
+                    else {
+                        cutoff = 1.5;
+                    }
+                    // Change the max-angle
+                    if (base_patch_groups.size() > 0 && is_ref_v_already_set == false) {
+                        max_angle = 0.0;
+                    }
+                    /*
+                    cout << "Before we begin new_bd_v is: " << new_bd_v << endl;
+                    cout << "From " << contrib_ext_id << " we find the new ref_v using faceset " << endl;
+                    for (auto f : faceset) {
+                        cout << f << " ";
+                    }
+                    cout << endl;
+                    */
+                    /*
+                    cout << "And the boundary_edges are: " << endl;
+                    for (auto h : boundary_edges) {
+                        cout << h << " ";
+                    }
+                    cout << endl;
+                    */
+
+                    //obj_save("mesh_used_to_compute_new_bd_v_for_ext_" + to_string(ext.id) + "_using_contrib_ext_id_" + to_string(contrib_ext_id) + ".obj", m);
+
+                    // Find the new boundary vertex with the highest curvature
+                    auto [tmp1, tmp2, peak_bd_vertices] = compute_new_bd_v_with_high_curvature(m_unsmoothed, 
+                            faceset, vertex_uv_map, boundary_edges, cutoff);
+
+                    // Go through all peak_bd_vertices
+                    for (auto peak : peak_bd_vertices) {
+                        auto bd_v = peak.first;
+                        auto angle = peak.second;
+   
+
+                        // Do a preliminary check to see if the edge that points to the boundary vertex actually exists
+                        HMesh::HalfEdgeID local_bd_h, candidate_bd_h;
+                        for (auto h : boundary_hes(m, faceset)) {
+                            if (m.walker(h).vertex() == bd_v) {
+                                local_bd_h = h;
+                            }
+                        }
+                        
+                        circulate_vertex_ccw(ext.m_state, ext.m_state.walker(local_bd_h).vertex(), [&](HMesh::HalfEdgeID h) {
+                            auto opp_h = ext.m_state.walker(h).opp().halfedge();
+                            if (m.walker(opp_h).vertex() == bd_v && patch_edges.find(opp_h) == patch_edges.end()) {
+                                candidate_bd_h = opp_h;
+                            }
+                        });
+
+                        /*
+                        cout << "bd_v != InvalidVertexID is: " << (bd_v != InvalidVertexID) << endl;
+                        cout << "candidate_bd_h != HMesh::InvalidHalfEdgeID is: " << (candidate_bd_h != HMesh::InvalidHalfEdgeID) << endl;
+                        cout << "angle > max_angle is: " << (angle > max_angle) << endl;
+                        cout << "!is_ref_v_already_set is: " << (!is_ref_v_already_set) << endl;
+                        */
+                        if (bd_v != InvalidVertexID && candidate_bd_h != HMesh::InvalidHalfEdgeID && angle > max_angle && !is_ref_v_already_set) {
+                            max_angle = angle;
+                            new_bd_v = bd_v;
+                            new_bd_vs = vertex_uv_map.find(bd_v)->second;
+                            bd_vs_responsible_extrusion = contrib_ext.id;
+                            HMesh::HalfEdgeID local_bd_h;
+                            index_of_bd_v_responsible_fs = kk;
+                            current_ref_v_face_set = faceset;
+
+                            // Select the bd_h as the edge on the face-loop which points towards the bd_v
+                            for (auto h : boundary_hes(m, faceset)) {
+                                if (m.walker(h).vertex() == new_bd_v) {
+                                    local_bd_h = h;
+                                }
+                            }
+                            /*
+                            cout << "The maximum angle is now: " << angle << endl;
+                            cout << "The new_bd_v is: " << new_bd_v << endl;
+                            cout << "local_bd_h is: " << local_bd_h << endl;
+                            cout.flush();
+                            */
+
+                            circulate_vertex_ccw(ext.m_state, ext.m_state.walker(local_bd_h).vertex(), [&](HMesh::HalfEdgeID h) {
+                                auto opp_h = ext.m_state.walker(h).opp().halfedge();
+                                if (m.walker(opp_h).vertex() == bd_v && patch_edges.find(opp_h) == patch_edges.end()) {
+                                    bd_h = opp_h;
+                                }
+                            });
+                            
+                            // The very special case with quadmeshes/bunny.obj, where the next extrusion (extrusion 37) only depends on one previous extrusion
+                            // namely extrusion 38, but the extrusion 37 only depends on a subset of the faces of the base-patch of extrusion 38.
+                            if (bd_h == HMesh::InvalidHalfEdgeID) {
+                                cout << "Problem in 'computing_new_bd_v_from_partial_prev_ext' in decomposing the mesh - The mesh seems to not have a proper face-loop structure" << endl;
+                                assert(false);
+                            }
+                        }
+                    }
+                    if (inside_base_patch) {
+                        is_ref_v_already_set = true;
+                    } 
+                }
+
+      
+ 
+                std::vector<MatrixXd> fs_loop_group;
+                std::vector<HMesh::FaceSet> fs_group;
+
+                for (int kk = 0; kk < face_groups.size(); kk++) {
+                    auto faceset = face_groups[kk].first;
+
+                    // --------------------------
+                    // Change the curves that make up the face sets
+                    // If the face set contains the new_bd_v, then we should change the order of the vertices in the curve
+                    // --------------------------
+                    vector<VertexID> bd_verts;
+
+                    auto unordered_bd_vertices = boundary_verts(m, faceset);
+
+                    if (unordered_bd_vertices.find(new_bd_v) != unordered_bd_vertices.end()) {
+                        bd_verts = find_boundary_vertices(m, faceset, new_bd_v);
+
+                    }
+                    else {
+                        bd_verts = find_boundary_vertices(m, faceset, *unordered_bd_vertices.begin());
+                    }
+                    MatrixXd fs_loop;
+
+                    fs_loop.resize(bd_verts.size(), 2);
+
+                    for(int i = 0; i < bd_verts.size(); i++) {
+
+                        if(vertex_uv_map.find(bd_verts[i]) != vertex_uv_map.end()) {
+
+                            Vec2d curr_bd_uv = vertex_uv_map.find(bd_verts[i])->second;
+
+                            fs_loop(i, 0) = curr_bd_uv[0];
+                            fs_loop(i, 1) = curr_bd_uv[1];
+                        }
+
+                    }
+                    //cout << "The fs_loop is: " << fs_loop << endl;
+                    fs_loop_group.push_back(fs_loop);
+                    fs_group.push_back(faceset);
+                }
+                // Rearrange the elements in the vector, so index_of_bd_v_responsible_fs becomes the last element in the vector
+                if (index_of_bd_v_responsible_fs >= 0) {
+                    std::rotate(fs_loop_group.begin() + index_of_bd_v_responsible_fs, fs_loop_group.begin() + index_of_bd_v_responsible_fs + 1, fs_loop_group.end());
+                    std::rotate(fs_group.begin() + index_of_bd_v_responsible_fs, fs_group.begin() + index_of_bd_v_responsible_fs + 1, fs_group.end());
+                }
+                extrusion_tree[contrib_ext.id].next_gen_extrusion_loops[ext.id] = fs_loop_group;
+                extrusion_tree[contrib_ext.id].next_gen_extrusion_face_sets[ext.id] = fs_group;
+
+            }
+
+        }
+    }
+
+    // --------------------------
+    // Update the extrusion element - including changing the bd_vs_responsible_extrusion
+    // --------------------------
+    // If the extrusion depends on more than one extrusion, then new_bd_v might actually occur in multiple contributing extrusions.
+    // This can happen in the following scenario: Extrusion 139 depends on Extrusion 140 and Extrusion 141, but extrusion 140 depends entirely
+    // on extrusion 141. If the new_bd_v is then in extrusion 141, it might also appear in Extrusion 140, because when we kill the face-loop in extrusion 140
+    // the vertex ID might be moved down, thus making it appear twice in both extrusions. We thus need to store the bd_h instead, as this will be unique. 
+    //cout << "Inside the function the extrusion is updated with bd_h: " << bd_h << " and new_bd_vs: " << new_bd_vs << endl;
+    update_extrusion_element_with_bd_v(extrusion_tree[ext.id].m_state, ext, bd_h, new_bd_vs);
+    extrusion_tree[ext.id].bd_vs_responsible_extrusion = bd_vs_responsible_extrusion;
+
+    extrusion_tree[ext.id].ref_v_face_set = current_ref_v_face_set;
 }
 
 /* ----------------------------------------------------------------------- *
@@ -1050,6 +1401,89 @@ void update_extrusions(HMesh::Manifold &m, HMesh::VertexID start_vertex) {
 }
 
 
+HarmonicMap  kill_selected_loop_hmap(Manifold& m, HalfEdgeID h, Extrusion ext) {
+
+    //save_face_loop_collapse_animation(m, h);
+
+    HMesh::FaceSet interior_faces = ext.base_face_set;
+
+    VertexSet patch_vertices;
+
+    FaceLoop above_loop;
+    FaceLoop below_loop;
+    FaceLoop l;
+
+    HalfEdgeAttributeVector<int> touched(m.no_halfedges(), 0);
+
+    FaceAttributeVector<int> visited(m.no_faces(), 0);
+
+    l = trace_face_loop(m, touched, h);
+
+    HMesh::HalfEdgeID h_above;
+    HMesh::HalfEdgeID h_below;
+
+    if(!check_leaf(m, h , 0) && !check_leaf(m, h, 1)) {
+        HarmonicMap hmap;
+        return hmap;
+    }
+    //find interior face set
+
+    HMesh::Manifold m_old = HMesh::Manifold(m);
+
+    std::vector<CGLA::Vec3d> old_vertex_positions;
+
+    std::vector<CGLA::Vec3d> old_face_centres;
+
+    std::map<HMesh::FaceID, CGLA::Vec3d> f_centre_map;
+
+    for (auto f : interior_faces) {
+        l.interior.insert(f);
+        circulate_face_ccw(m, f, [&] (VertexID v) {
+          patch_vertices.insert(v);
+          old_vertex_positions.push_back(m.pos(v));
+        });
+        old_face_centres.push_back(centre(m,f));
+
+        f_centre_map.insert({f, centre(m,f)});
+    }
+
+    std::vector<CGLA::Vec3d> ext_pos;
+
+    for(auto v: patch_vertices) {
+      ext_pos.push_back(m.pos(v));
+    }
+
+    if(check_leaf(m, h, 0)) {
+        FaceLoop l_rev = trace_face_loop(m, touched, m.walker(l.hvec[0]).next().next().halfedge());
+        remove_face_loop(m, l_rev);
+    }
+    else {
+        remove_face_loop(m, l);
+    }
+
+    smooth_faceset_lap_solve(m, interior_faces);
+
+    std::vector<CGLA::Vec3d> new_vertex_positions;
+    std::vector<HMesh::VertexID> new_vertex_ids;
+
+    for (auto f : interior_faces) {
+        l.interior.insert(f);
+        circulate_face_ccw(m, f, [&] (VertexID v) {
+          new_vertex_positions.push_back(m.pos(v));
+          new_vertex_ids.push_back(v);
+        });
+    }
+
+    // TC: Commented out 5.6.2025
+
+    HarmonicMap hmap(m, interior_faces, ext.origin_face, ext.right_face);
+
+    hmap.input_ext_vertices(new_vertex_ids, old_vertex_positions, f_centre_map);
+
+    return hmap;
+}
+
+
 // TC: Kill the individual features
 std::stack<HarmonicMap> kill_individual_feature_hmap(Manifold& m, HalfEdgeID h, int pos_flag, Extrusion ext) {
 
@@ -1102,6 +1536,39 @@ std::stack<HarmonicMap> kill_individual_feature_hmap(Manifold& m, HalfEdgeID h, 
             work_done = true;
             extrusion_stack.push(vecs);
             //cout<<vecs.first.first<<endl<<vecs.first.second<<endl;
+            break;
+        }
+    } while (work_done);
+
+    return extrusion_stack;
+}
+
+
+std::stack<HarmonicMap> kill_feature_local_hmap(Manifold& m, HalfEdgeID h, int pos_flag, Extrusion ext) {
+
+    std::stack<HarmonicMap> extrusion_stack;
+
+    if(!check_leaf_stack(m, h, pos_flag))
+      return extrusion_stack;
+
+    std::vector<HMesh::HalfEdgeID> feature_edges = find_face_loop_stack(m, h , pos_flag);
+
+    reverse(feature_edges.begin(), feature_edges.end());
+
+    bool work_done;
+
+    work_done = false;
+    do {
+        work_done = false;
+        for(auto h: feature_edges) {
+            if(!m.in_use(h)) {
+                continue;
+            }
+
+            auto vecs = kill_selected_loop_hmap(m, h, ext);
+
+            work_done = true;
+            extrusion_stack.push(vecs);
             break;
         }
     } while (work_done);
