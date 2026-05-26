@@ -33,6 +33,7 @@
 #include <GEL/Util/Timer.h>
 
 #include <GEL/GLGraphics/VisObj.h>
+#include <GEL/HMesh/feq.h>
 
 using namespace std;
 using namespace CGLA;
@@ -1355,6 +1356,56 @@ namespace GLGraphics {
             valid(me->active_mesh());
             return;
         }
+
+        /* ----------------------------------------------------------------------- *
+         * Code for selecting an halfedge on a mesh given the ID of the halfedge
+         * ----------------------------------------------------------------------- */
+        void console_select_halfedge_by_id(MeshEditor* me, const std::vector<std::string> & args) {
+
+            Manifold& m = me->active_mesh();
+            me->save_active_mesh();
+            HalfEdgeAttributeVector<int> touched(m.no_halfedges(), 0);
+            int h_id = console_arg(args, 0, 1);
+
+            HalfEdgeID h = HalfEdgeID(h_id);
+
+            me->active_visobj().get_halfedge_selection().insert(h);
+
+            me->post_create_display_list();
+            return;
+        }
+
+        /* ----------------------------------------------------------------------- *
+         * Code for interactive mesh decomposition
+         * ----------------------------------------------------------------------- */
+        void console_kill_extrusions(MeshEditor* me, const std::vector<std::string> & args) {
+
+            // The active mesh
+            Manifold& m = me->active_mesh();
+            me->save_active_mesh();
+
+            // Set the direction of decomposition
+            int pos_flag = console_arg(args, 0, 1);
+
+            Extrusion curr_ext;
+
+            // Select the edge, which indicates a face-loop from where we can decompose.
+            HMesh::HalfEdgeID h = *me->active_visobj().get_halfedge_selection().begin();
+
+            Generic_Extrusion gen_ext;
+
+            std::map<int,Extrusion> extrusion_tree;
+            std::map<HMesh::FaceID, std::tuple<int, std::vector<HMesh::HalfEdgeID>, bool, HMesh::FaceSet>> face_loop_prev_edge;
+
+            if (m.in_use(h)) {
+                std::tie(extrusion_tree, face_loop_prev_edge) = kill_individual_extrusions_hmap(m, h, pos_flag, gen_ext, HMesh::InvalidVertexID);
+            }
+            cout << "The size of the extrusion tree: " << extrusion_tree.size() << endl;
+
+            me->post_create_display_list();
+
+            return;
+        }
         
         
         void console_remove_caps(MeshEditor* me, const std::vector<std::string> & args)
@@ -1955,6 +2006,7 @@ namespace GLGraphics {
         float material[4] = {1,1,1,1};
         glMaterialfv(GL_FRONT_AND_BACK, GL_DIFFUSE, material);
         glEnable(GL_DEPTH_TEST);
+
         
         register_console_function("quit", console_quit,"");
         register_console_function("exit", console_quit,"");
@@ -2002,7 +2054,11 @@ namespace GLGraphics {
         register_console_function("noise.perturb_vertices_perpendicular", console_perpendicular_vertex_noise,"");
         register_console_function("noise.perturb_topology", console_noisy_flips,"");
         
-        
+        // FEQ code
+        register_console_function("gem.select_edge", console_select_halfedge_by_id,"");
+        register_console_function("feq.kill_extrusions", console_kill_extrusions,"");
+
+
         register_console_function("align_with", console_align,"");
         register_console_function("undo", console_undo,"");
         

@@ -20,13 +20,14 @@
 #include <GEL/HMesh/HMesh.h>
 #include <GEL/Geometry/Graph.h>
 #include <GEL/HMesh/Manifold.h>
+#include <GEL/Geometry/KDTree.h>
 #include <stack>
-#include "HarmonicMap.h"
+#include <GEL/HMesh/HarmonicMap.h>
 
 #include <Eigen/Dense>
 #include <Eigen/Sparse>
 #include <GEL/Geometry/KDTree.h>
-
+#include <GEL/HMesh/load.h>
 
  /* ----------------------------------------------------------------------- *
   * Struct to store an extrusion element
@@ -211,6 +212,14 @@ public:
     
     HMesh::FaceSet get_base_face_set() {return base_face_set;}
 };
+
+
+
+std::pair< std::map<int,Extrusion>, std::map<HMesh::FaceID, std::tuple<int, std::vector<HMesh::HalfEdgeID>, bool, HMesh::FaceSet>> > kill_individual_extrusions_hmap(HMesh::Manifold &m, 
+                                                                                                                                                                    HMesh::HalfEdgeID h, 
+                                                                                                                                                                    int pos_flag, 
+                                                                                                                                                                    Generic_Extrusion &gen_ext, 
+                                                                                                                                                                    HMesh::VertexID start_vertex);
 
 
 #endif

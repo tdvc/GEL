@@ -191,7 +191,7 @@ public:
 
     void uv_to_bary(CGLA::Vec2d v_uv, HMesh::VertexID& va, HMesh::VertexID& vb, HMesh::VertexID& vc, double& u, double& v, double& w);
 
-    int uv_to_face(CGLA::Vec2d v);
+    int uv_to_face(CGLA::Vec2d v_uv);
 
     CGLA::Mat3x3d get_patch_frame(CGLA::Vec3d bd_pt);
 
@@ -211,8 +211,6 @@ public:
 
     HarmonicMap(HMesh::Manifold m, HMesh::FaceSet patch_faces, HMesh::FaceID centre_face, HMesh::FaceID right_face);
 
-
-    
 
     HarmonicMap() {};
 

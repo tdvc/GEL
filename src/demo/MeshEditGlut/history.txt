@@ -1,1 +1,7 @@
 exit
+load_mesh 50002_chicken_wings_00010.obj
+exit
+load_mesh 50002_chicken_wings_00010.obj
+gem.select_edge 1461
+feq.kill_extrusions 0
+exit

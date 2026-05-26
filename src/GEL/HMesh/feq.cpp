@@ -15,6 +15,40 @@ std::map<int,Extrusion> extrusion_tree;
 // Variable to store, whether a face is part of the base-base patch, or is on a face-loop
 std::map<HMesh::FaceID, bool> face_patch_flag;
 
+
+Generic_Extrusion::Generic_Extrusion() {
+    
+    if (!load(("gen_ext.obj"),m)) {
+        cout << "Could not load the generic extrusion" << endl;
+    };
+    
+    // Get the positions
+    pos = m.positions_attribute_vector();
+    
+    
+    for (auto f : m.faces()) {
+        curr_ext_faces.insert(f);
+    }
+    
+    for(auto v : all_verts(m, curr_ext_faces)) {
+        if(vertex_uv_map.find(v) == vertex_uv_map.end()) {
+            Vec2d uv = CGLA::Vec2d(m.pos(v)[0], m.pos(v)[1]);
+            vertex_uv_map.insert(std::make_pair(v, uv));
+      }
+    }
+
+    // Initialize the kDtree
+    for (auto it = vertex_uv_map.begin(); it != vertex_uv_map.end(); it++) {
+        uv_tree.insert(it->second, it->first.index);
+    }
+    uv_tree.build();
+
+    // Find rim vertices (boundary vertices on the entire extrusion)
+    // Note: There are no particular order, because we don't have a 'start vertex'
+    rim_vertices = boundary_verts(m, curr_ext_faces);
+    
+}
+
 /* ----------------------------------------------------------------------- *
  * TC: This function checks, whether a face-loop is self-adjacent. It basically means that for a face-loop on a FEQ-mesh, 
  * if the neighbour face above a face in the face-loop, or a neighbour face below a face in the face-loop is also part of the face-loop
@@ -1957,3 +1991,5 @@ std::pair< std::map<int,Extrusion>, std::map<HMesh::FaceID, std::tuple<int, std:
 
     return {extrusion_tree, face_loop_prev_edge};
 }
+
+

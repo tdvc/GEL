@@ -61,6 +61,56 @@ int find_barycentric_coords(Eigen::MatrixXd p, Eigen::MatrixXd V, Eigen::MatrixX
   return -1;
 }
 
+CGLA::Vec2d HarmonicMap::find_bd_intersection(CGLA::Vec2d uv) {
+
+  for(int i = 0; i < bnd_uv.rows(); i++) {
+    //double t;
+
+    int curr_index = i;
+    int next_index = (i+1)%bnd_uv.rows();
+
+    Eigen::Matrix <double, 1, 3> p;
+    Eigen::Matrix <double, 1, 3> r;
+    Eigen::Matrix <double, 1, 3> q;
+    Eigen::Matrix <double, 1, 3> s;
+
+    p << uv[0], uv[1], 0.0;
+    r << 0.0, 0.0, 0.0;
+    //r << boundary_face_uv_centres(i,0), boundary_face_uv_centres(i,1), 0.0;
+    q << bnd_uv(i, 0), bnd_uv(i, 1), 0.0;
+    s << bnd_uv(next_index, 0), bnd_uv(next_index, 1), 0;
+
+    double t, u;
+
+    if(igl::segment_segment_intersect(p, r - p, q, s - q, t, u)) {
+
+
+      return CGLA::Vec2d(p(0,0) + t*(-p(0,0)), p(0,1) + t*(-p(0,1)));
+    }
+
+  }
+  return CGLA::Vec2d(0.0);
+}
+
+int HarmonicMap::uv_to_face(CGLA::Vec2d v_uv) {
+
+  Eigen::Matrix<double, 1, 2> p;
+  p << v_uv[0], v_uv[1];
+  Eigen::VectorXd bary_coords;
+  Eigen::VectorXi vertex_ids;
+  int face_id = find_barycentric_coords(p, V_uv, F, bary_coords, vertex_ids);
+
+  if(face_id == -1) {
+    v_uv = find_bd_intersection(v_uv);
+    Eigen::Matrix<double, 1, 2> bd_p;
+    bd_p << v_uv[0], v_uv[1];
+
+    face_id = find_barycentric_coords(bd_p, V_uv, F, bary_coords, vertex_ids);
+  }
+  return face_id;
+
+}
+
 /* ----------------------------------------------------------------------- *
  * Given two 2D points p1 and p2, find the intersection between the line segment between p1 and p2 
  * and the unit circle - Used in later functions to determine the 3D position of a point in the parameterized map
