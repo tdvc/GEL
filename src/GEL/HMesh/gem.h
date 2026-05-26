@@ -18,6 +18,8 @@ bool isInteger(const std::string& str);
 
 HMesh::VertexSet all_verts(const HMesh::Manifold& m, const HMesh::FaceSet& fs);
 
+HMesh::VertexSet find_interior_vertices(const HMesh::Manifold &m, HMesh::FaceSet patch_faces);
+
 HMesh::HalfEdgeSet all_edges(const HMesh::Manifold& m, const HMesh::FaceSet& fs);
 
 HMesh::HalfEdgeSet all_edges_wo_duplicates(const HMesh::Manifold& m, const HMesh::FaceSet& fs);
@@ -52,6 +54,10 @@ HMesh::HalfEdgeID find_connecting_edge(HMesh::Manifold m, HMesh::VertexID v1, HM
 
 HMesh::FaceID find_shared_face(HMesh::Manifold &m, HMesh::VertexID v1, HMesh::VertexID v2);
 
+bool vertex_vertex_connection(HMesh::Manifold m, HMesh::VertexID v1, HMesh::VertexID v2);
+
+bool vertex_edge_connection(HMesh::Manifold m, HMesh::VertexID v1, HMesh::HalfEdgeID h);
+
 double area_of_polygon(Eigen::MatrixXd curr_loop_V);
 
 double area_of_curve_inside_circle(Eigen::MatrixXd curr_loop_V);
@@ -70,6 +76,26 @@ std::tuple<HMesh::FaceID, HMesh::VertexID, HMesh::VertexID, HMesh::VertexID, dou
 
 std::pair<HMesh::HalfEdgeID, double> locate_point_on_edge(HMesh::Manifold&m, std::map<HMesh::VertexID, CGLA::Vec2d>& v_uv_map, CGLA::Vec2d p);
 
+bool vertex_face_connection(HMesh::Manifold m, HMesh::FaceSet base_patch_faces, std::map<HMesh::VertexID, CGLA::Vec2d>& v_uv_map, HMesh::VertexID v1, CGLA::Vec2d p);
+
 void delaunay_triangulate_each_single_face2(HMesh::Manifold &m, HMesh::Manifold &m_copy, HMesh::FaceSet& base_patch_faces, HMesh::FaceSet& base_patch_faces_copy, std::map<HMesh::VertexID, CGLA::Vec2d>& v_uv_map, std::map<HMesh::VertexID, CGLA::Vec2d>& v_uv_map_copy, std::vector<std::tuple<int, HMesh::FaceSet, HMesh::VertexID, bool, std::vector<HMesh::VertexID>>> &curve_enclosed_faces, std::map<HMesh::VertexID, std::tuple<CGLA::Vec2d, HMesh::VertexID, HMesh::VertexID, double>>& new_vertices);
+
+
+void close_holes_in_fs(HMesh::Manifold &m, 
+                        std::vector<std::tuple<HMesh::FaceSet, bool, bool, std::string, int>> &faces_2_be_extruded,
+                        std::map<int, std::pair<int, std::tuple<HMesh::Manifold, 
+                                                                                                    HMesh::FaceSet, 
+                                                                                                    HMesh::FaceSet, 
+                                                                                                    std::map<HMesh::VertexID,CGLA::Vec2d>,
+                                                                                                    HMesh::VertexID, 
+                                                                                                    std::map<HMesh::FaceID, bool>,
+                                                                                                    HMesh::Manifold, 
+                                                                                                    std::vector<HMesh::HalfEdgeID>,
+                                                                                                    std::map<HMesh::VertexID,CGLA::Vec2d>
+                                                                                                    >>>& face_map);
+
+HMesh::FaceSet check_faceset_connectivity(HMesh::Manifold &m, HMesh::FaceSet face_set);
+
+HMesh::FaceSet extract_face_set(std::vector<std::tuple<HMesh::FaceSet, bool, bool, std::string, int>>& faces_2_be_extruded);
 
 #endif /* gem_hpp */

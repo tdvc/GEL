@@ -8,6 +8,7 @@
 #include <GEL/HMesh/HMesh.h>
 #include <GEL/HMesh/Manifold.h>
 #include <igl/winding_number.h>
+#include <nanoflann.hpp>
 
 using namespace std;
 using namespace CGLA;
@@ -2963,7 +2964,9 @@ std::vector<std::tuple<int, HMesh::FaceSet, CGLA::Vec2d, std::vector<HMesh::Vert
 }
 
 
-
+/* ----------------------------------------------------------------------- *
+ * Function for manipulating the decision curve
+ * ----------------------------------------------------------------------- */
 std::vector<std::tuple<CGLA::Vec2d, HMesh::VertexID>> contract_curve(HMesh::Manifold m, HMesh::FaceSet base_patch, std::map<HMesh::VertexID, CGLA::Vec2d>& v_uv_map, std::vector<CGLA::Vec2d> curve, double radius, Geometry::KDTree<CGLA::Vec2d, HMesh::VertexID> bd_verts_tree) {
 
     auto bd_edges = boundary_hes(m, base_patch);
@@ -3045,6 +3048,417 @@ std::vector<std::tuple<CGLA::Vec2d, HMesh::VertexID>> contract_curve(HMesh::Mani
     return final_curve;
 }
 
+/* ----------------------------------------------------------------------- *
+ * Function for manipulating the decision curve
+ * ----------------------------------------------------------------------- */
+std::vector<std::tuple<CGLA::Vec2d, HMesh::VertexID, bool, HMesh::HalfEdgeID>> move_segment_to_boundary(HMesh::Manifold m, HMesh::FaceSet base_patch, std::map<HMesh::VertexID, CGLA::Vec2d>& v_uv_map, std::vector<std::tuple<CGLA::Vec2d, HMesh::VertexID>> curve) {
+
+    int N = curve.size();
+
+    double eps = 1e-8;
+
+    std::vector<std::tuple<CGLA::Vec2d, HMesh::VertexID, bool, HMesh::HalfEdgeID>> altered_curve;
+
+    auto bd_edges = boundary_hes(m, base_patch);
+
+    auto bd_vertices = ccw_ordered_bd_vertices(m, base_patch, *boundary_verts(m, base_patch).begin());
+
+    /*
+    cout << "The bd_vertices are: " << endl;
+    for (auto v : bd_vertices) {
+        cout << "v: " << v << " uv_coordinates: " << v_uv_map.find(v)->second << endl;
+    }
+    */
+
+    for (int ii = 0; ii < curve.size(); ii++) {
+        auto a = std::get<0>(curve[ii]); // Vec2d
+        auto a_boundary_vertex = std::get<1>(curve[ii]); // VertexID
+ 
+        auto b = std::get<0>(curve[(ii+1)%N]); // Vec2d
+        auto b_boundary_vertex = std::get<1>(curve[(ii+1)%N]); // VertexID
+
+
+        // Insert the point, if it is a boundary vertex
+        if (a_boundary_vertex != HMesh::InvalidVertexID) {
+            // It is a boundary vertex
+            altered_curve.push_back({a, a_boundary_vertex, false, HMesh::InvalidHalfEdgeID});
+        }
+        else {
+            // It is not a boundary vertex
+            altered_curve.push_back({a, HMesh::InvalidVertexID, false, HMesh::InvalidHalfEdgeID});
+        }
+
+        // Ensure that the points a and b are actually placed on the vertices
+        if (a_boundary_vertex != HMesh::InvalidVertexID && b_boundary_vertex != HMesh::InvalidVertexID) {
+
+            int start_index = -1;
+            int end_index = -1;
+
+            std::vector<HMesh::VertexID> bd_vertices_to_add;
+            auto it = std::find(bd_vertices.begin(), bd_vertices.end(), a_boundary_vertex);
+            int index = it - bd_vertices.begin() + 1;
+            auto new_bd_v = bd_vertices[index%bd_vertices.size()];
+
+            while (new_bd_v != b_boundary_vertex) {
+                altered_curve.push_back({v_uv_map.find(new_bd_v)->second, new_bd_v, false, HMesh::InvalidHalfEdgeID});
+
+                index += 1;
+                new_bd_v = bd_vertices[index%bd_vertices.size()];
+            }
+        }
+    }
+
+   return altered_curve;
+}
+
+// This function simply ensures that we do not snap a point to a vertex, such that it cannot be connected to the other points in the curve
+bool can_neighbours_be_connected(HMesh::Manifold m, HMesh::FaceSet base_patch_faces, std::map<HMesh::VertexID, CGLA::Vec2d>& v_uv_map, HMesh::VertexID closest_interior_vertex, int ii, std::vector<std::tuple<CGLA::Vec2d, HMesh::VertexID, bool, HMesh::HalfEdgeID>> altered_curve) {
+
+    int N = altered_curve.size();
+
+    auto prev_point = std::get<0>(altered_curve[(ii - 1 + N) % N]);
+    auto prev_vertex = std::get<1>(altered_curve[(ii - 1 + N) % N]);
+    auto prev_edge = std::get<3>(altered_curve[(ii - 1 + N) % N]);
+
+    bool prev_point_connected = false;
+    // Check if its connected to the previous point
+    if (prev_vertex != HMesh::InvalidVertexID) {
+        prev_point_connected = vertex_vertex_connection(m, closest_interior_vertex, prev_vertex);
+    }
+    else if (prev_edge != HMesh::InvalidHalfEdgeID) {
+        prev_point_connected = vertex_edge_connection(m, closest_interior_vertex, prev_edge);
+    }
+    else {
+        prev_point_connected = vertex_face_connection(m, base_patch_faces, v_uv_map, closest_interior_vertex, prev_point);
+    }
+    if (!prev_point_connected) {
+        return false;
+    }
+
+
+    auto next_point = std::get<0>(altered_curve[(ii + 1) % N]);
+    auto next_vertex = std::get<1>(altered_curve[(ii + 1) % N]);
+    auto next_edge = std::get<3>(altered_curve[(ii + 1) % N]);
+
+    bool next_point_connected = false;
+    // Check if its connected to the next point
+    if (next_vertex != HMesh::InvalidVertexID) {
+        next_point_connected = vertex_vertex_connection(m, closest_interior_vertex, next_vertex);
+    }
+    else if (next_edge != HMesh::InvalidHalfEdgeID) {
+        next_point_connected = vertex_edge_connection(m, closest_interior_vertex, next_edge);
+    }
+    else {
+        next_point_connected = vertex_face_connection(m, base_patch_faces, v_uv_map, closest_interior_vertex, next_point);
+    }
+    if (!next_point_connected) {
+        return false;
+    }
+
+
+    return true;
+}
+
+
+// The purpose of this function is to snap curve points to interior vertices of the base-patch, if the points are a distance 
+// d away from the vertex. This d can be e.g. 10% of the smallest edge-length.
+std::vector<std::tuple<CGLA::Vec2d, HMesh::VertexID, bool, HMesh::HalfEdgeID>> snap_curve_points(HMesh::Manifold m, HMesh::FaceSet base_patch_faces, std::map<HMesh::VertexID, CGLA::Vec2d>& v_uv_map, std::vector<std::tuple<CGLA::Vec2d, HMesh::VertexID, bool, HMesh::HalfEdgeID>> curve_extended, double threshold) {
+
+    //cout << "Inside snapping points function." << endl;
+
+    auto interior_vertices = find_interior_vertices(m, base_patch_faces);
+
+    Geometry::KDTree<CGLA::Vec2d, HMesh::VertexID> interior_verts_tree;
+    // Initialize the tree
+    for (auto v : interior_vertices) {
+        interior_verts_tree.insert(v_uv_map.find(v)->second, v);
+    }
+    interior_verts_tree.build();
+
+    std::vector<std::tuple<CGLA::Vec2d, HMesh::VertexID, bool, HMesh::HalfEdgeID>> altered_curve = curve_extended; 
+
+    int N = curve_extended.size();
+
+    CGLA::Vec2d closest_interior_point;
+    HMesh::VertexID closest_interior_vertex;
+
+    // A variable used for the check below, where we ensure that no vertex is 
+    int start_point = -1;
+    HMesh::VertexSet bd_vertices;
+    std::map<HMesh::VertexID, std::vector<int>> snapped_interior_vertices;
+
+    for (int ii = 0; ii < N; ii++) {
+        auto p = std::get<0>(curve_extended[ii]);
+        auto p_boundary_vertex = std::get<1>(curve_extended[ii]);
+
+        // Check that the curve point is not on the boundary
+        if (p_boundary_vertex == HMesh::InvalidVertexID) {
+
+            double dist = std::numeric_limits<double>::infinity();
+            interior_verts_tree.closest_point(p, dist, closest_interior_point, closest_interior_vertex);
+
+            double shortest_edge_length = std::numeric_limits<double>::infinity();
+            HMesh::HalfEdgeID shortest_edge = HMesh::InvalidHalfEdgeID;
+            circulate_vertex_ccw(m, closest_interior_vertex, [&](HalfEdgeID h) {
+                auto edge_length = length(v_uv_map.find(m.walker(h).opp().vertex())->second - v_uv_map.find(m.walker(h).vertex())->second);
+                
+                
+                //if (is_point_on_edge(m, h, v_uv_map, p)) {
+                if (edge_length < shortest_edge_length) {
+                    //cout << "p: " << p << " is on the line between " << v_uv_map.find(m.walker(h).opp().vertex())->second << " and: " << v_uv_map.find(m.walker(h).vertex())->second << endl;
+                    shortest_edge_length = edge_length;
+                    shortest_edge = h;
+                }
+            });
+
+            //cout << "Investigating point: " << p << endl;
+
+            //cout << "The closest interior vertex is: " << closest_interior_vertex << " with uv-coordinates: " << closest_interior_point << " at distance: " << dist << endl;     
+
+            if (shortest_edge != HMesh::InvalidHalfEdgeID) {
+
+                auto edge_dist = length(v_uv_map.find(m.walker(shortest_edge).opp().vertex())->second - v_uv_map.find(m.walker(shortest_edge).vertex())->second);
+
+                //cout << "The ratio distance is: " << (dist / edge_dist) << " and the threshold is: " << threshold << endl;
+
+                if (dist / edge_dist < threshold) {
+
+                    if (can_neighbours_be_connected( m, base_patch_faces, v_uv_map, closest_interior_vertex, ii, altered_curve)) {
+                        std::get<0>(altered_curve[ii]) = closest_interior_point;
+                        std::get<1>(altered_curve[ii]) = closest_interior_vertex; // Even though it is not a boundary vertex, we set it to be a vertex
+                        std::get<2>(altered_curve[ii]) = false; // Set whether it is on an edge
+                        std::get<3>(altered_curve[ii]) = HMesh::InvalidHalfEdgeID; // Set the HalfEdgeID
+
+                    }
+
+                    //cout << "Snapped point to vertex: " << closest_interior_vertex << " with uv-coordinates: " << closest_interior_point << " and the coordinates are now: " << std::get<0>(altered_curve[ii]) << endl;
+                }
+            }
+        }
+        else {
+            bd_vertices.insert(p_boundary_vertex);
+            start_point = ii;
+        }
+    }
+
+    // It might happen, that the curve cuts around a vertex with high valuence, but not all edge points are contracted to the point. Therefore we should loop through the curve and detect if multiple 
+    // points are mapped to the same vertex and if there are points in between those, that are not mapped to the same vertex.
+    // Note: We use this weird ordering, because it is necessary to avoid confusion to, where we start, so we need to start at a boundary vertex,
+    // because then we need that the rest of the sequence will be in the right order
+    assert(start_point != -1);
+    for (int ii = start_point; ii < start_point + N; ii++) {
+
+        auto vertex = std::get<1>(altered_curve[ii%N]);
+
+        // Make sure that we have an interior vertex, so it is not a boundary vertex
+        if (vertex != HMesh::InvalidVertexID && bd_vertices.find(vertex) == bd_vertices.end()) {
+            
+            if (snapped_interior_vertices.find(vertex) == snapped_interior_vertices.end()) {
+                std::vector<int> indices = {ii};
+                snapped_interior_vertices.insert(std::make_pair(vertex, indices));
+            }
+            else {
+                snapped_interior_vertices.find(vertex)->second.push_back(ii);
+            }
+        }
+    }
+
+    for (auto it : snapped_interior_vertices) {
+        auto vertex = it.first;
+        auto indices = it.second;
+
+        for (int jj = 0; jj < indices.size()-1; jj++) {
+            
+            auto first_occurence = indices[jj]; // The first occurence of the interior vertex
+            auto next_occurence = indices[jj+1]; // The next occurence of the interior vertex
+
+            // Then change all of the in between nodes
+            for (int kk = first_occurence; kk < next_occurence; kk++) {
+
+                int index = kk%N; // Get the right index
+                std::get<0>(altered_curve[index]) = v_uv_map.find(vertex)->second;
+                std::get<1>(altered_curve[index]) = vertex;
+                std::get<2>(altered_curve[index]) = false;
+                std::get<3>(altered_curve[index]) = HMesh::InvalidHalfEdgeID;
+            }
+        }
+    }
+    
+    // Remove duplicates
+    curve_extended.clear();
+    for (int ii = 0; ii < altered_curve.size(); ii++) {
+
+        // Keep if it is a boundary vertex
+        if (bd_vertices.find(std::get<1>(altered_curve[(ii+1)%N])) != bd_vertices.end()) {
+            curve_extended.push_back(altered_curve[(ii+1)%N]);
+        }
+        // Keep if it is at an interior vertex, which is not the same as the previous one
+        else if (std::get<1>(altered_curve[(ii+1)%N]) != HMesh::InvalidVertexID && std::get<1>(altered_curve[ii]) != std::get<1>(altered_curve[(ii+1)%N]) ) {
+            curve_extended.push_back(altered_curve[(ii+1)%N]);
+        }
+        // Keep if it is on an edge
+        else if (std::get<2>(altered_curve[(ii+1)%N])) {
+            curve_extended.push_back(altered_curve[(ii+1)%N]);
+        }
+        // Keep only if it is further away from the previous one
+        else {
+            if (length(std::get<0>(altered_curve[ii]) - std::get<0>(altered_curve[(ii+1)%N])) > 1e-10) {
+                curve_extended.push_back(altered_curve[(ii+1)%N]);
+            }
+        }
+    }
+
+    return curve_extended;
+}
+
+struct edge_item {
+    double value;
+    CGLA::Vec2d attribute;
+    HMesh::HalfEdgeID h;
+};
+
+std::vector<std::tuple<CGLA::Vec2d, HMesh::VertexID, bool, HMesh::HalfEdgeID>> subdivide_curve(HMesh::Manifold &m, HMesh::FaceSet base_patch_faces, std::map<HMesh::VertexID, CGLA::Vec2d>& v_uv_map, std::vector<std::tuple<CGLA::Vec2d, HMesh::VertexID, bool, HMesh::HalfEdgeID>> curve) {
+
+    std::vector<std::tuple<CGLA::Vec2d, HMesh::VertexID, bool, HMesh::HalfEdgeID>> subdived_curve;
+
+    auto patch_edges = all_edges_wo_duplicates(m, base_patch_faces);
+
+    double eps = 1e-3;
+    // ----------------------------------------------------
+    // Check if any curve points are very close to an interior edge
+    // ----------------------------------------------------
+    for (auto &it : curve) {
+        auto p = std::get<0>(it);
+        auto p_boundary_vertex = std::get<1>(it);
+        auto p_is_on_edge = std::get<2>(it);
+
+        //cout << "Point: " << p << " is very close to an edge, marking as on edge." << endl;
+
+        if (p_boundary_vertex == HMesh::InvalidVertexID && !p_is_on_edge) {
+            double min_dist = std::numeric_limits<double>::infinity();
+            // Projection onto the edge
+            CGLA::Vec2d min_projection;
+            HMesh::HalfEdgeID projected_edge = HMesh::InvalidHalfEdgeID;
+
+            for (auto h : patch_edges) {
+                auto v1 = m.walker(h).vertex();
+                auto v2 = m.walker(h).opp().vertex();
+
+                auto p1 = v_uv_map.find(v1)->second;
+                auto p2 = v_uv_map.find(v2)->second;
+
+                // Project point p onto line segment p1-p2
+                CGLA::Vec2d line_vec = p2 - p1;
+                CGLA::Vec2d p_vec = p - p1;
+
+                double t = dot(p_vec, line_vec) / dot(line_vec, line_vec);
+
+                // Clamp t to the range [0, 1] to stay within the segment
+                t = std::max(0.0, std::min(1.0, t));
+
+                CGLA::Vec2d projection = p1 + t * line_vec;
+
+                double dist = length(p - projection);
+                if (dist < min_dist) {
+                    min_dist = dist;
+                    min_projection = projection;
+                    projected_edge = h;
+                }
+            }
+
+            if (min_dist < eps) {
+                std::get<0>(it) = min_projection;
+                std::get<2>(it) = true;
+                std::get<3>(it) = projected_edge;
+
+            }
+        }
+    }
+
+    // ----------------------------------------------------
+    // Find edge intersections and subdivide the curve accordingly
+    // ----------------------------------------------------
+    for (int ii = 0; ii < curve.size(); ii++) {
+        auto p1 = std::get<0>(curve[ii]); // Vec2d 
+        auto p1_boundary_vertex = std::get<1>(curve[ii]); // VertexID of boundary vertex
+        auto p1_on_edge = std::get<2>(curve[ii]); 
+        auto p1_projected_edge = std::get<3>(curve[ii]);
+
+        auto p2 = std::get<0>(curve[(ii+1)%curve.size()]); // Vec2d 
+        auto p2_boundary_vertex = std::get<1>(curve[(ii+1)%curve.size()]); // VertexID of boundary vertex
+        auto p2_projected_edge = std::get<3>(curve[(ii+1)%curve.size()]);
+
+        if (p1_boundary_vertex != HMesh::InvalidVertexID) {
+            subdived_curve.push_back({p1, p1_boundary_vertex, false, HMesh::InvalidHalfEdgeID});
+        }
+        else {
+            subdived_curve.push_back({p1, HMesh::InvalidVertexID, p1_on_edge, HMesh::InvalidHalfEdgeID});
+        }
+
+        if (p1_boundary_vertex != HMesh::InvalidVertexID && p2_boundary_vertex != HMesh::InvalidVertexID) {
+            continue;
+        }
+
+
+        //cout << "p1: " << p1 << " p1_projected_edge: " << p1_projected_edge << endl;
+        //cout << "p2: " << p2 << "p2_projected_edge: " << p2_projected_edge << endl;
+
+        std::vector<edge_item> edge_intersections;
+
+        //cout << "Finding potential edge intersections between: " << p1 << " and " << p2 << endl;
+
+        for (auto h : patch_edges) {
+
+            auto [intersection, u] = do_edge_intersect_curve_t_value(m, h, p1, p2, v_uv_map);
+
+            if (intersection) {
+                //cout << "Edge h: " << h << " between: " << v_uv_map.find(m.walker(h).vertex())->second << " and: " << v_uv_map.find(m.walker(h).opp().vertex())->second  << " intersection is: " << intersection << endl;
+
+                edge_intersections.push_back({u, p1 + u * (p2 - p1), h});
+            }
+        }
+
+        std::sort(edge_intersections.begin(), edge_intersections.end(), [](const edge_item& a, const edge_item& b) {
+            return a.value < b.value;
+        });
+
+        for (const auto& e : edge_intersections) {
+            //cout << "Inserting point: " << e.attribute << " as it is on edge: " << e.h << endl;
+
+            // Making sure that we do not have two points on the same edge
+            if (e.h != p1_projected_edge && e.h != m.walker(p1_projected_edge).opp().halfedge() && e.h != p2_projected_edge && e.h != m.walker(p2_projected_edge).opp().halfedge()) {
+                subdived_curve.push_back({e.attribute, HMesh::InvalidVertexID, true, e.h}) ; // False on boundary, True on edge
+            }
+        }
+    }
+
+
+    // ----------------------------------------------------
+    // Remove duplicate points that are not on the boundary
+    // ----------------------------------------------------
+    std::vector<std::tuple<CGLA::Vec2d, HMesh::VertexID, bool, HMesh::HalfEdgeID>> curve_extended;
+
+    int N = subdived_curve.size();
+    for (int ii = 0; ii < subdived_curve.size(); ii++) {
+        // Include the point if it is a boundary vertex, or it's predecessor is a boundary vertex
+        if (std::get<1>(subdived_curve[ii]) != HMesh::InvalidVertexID || std::get<1>(subdived_curve[(ii+1)%N]) != HMesh::InvalidVertexID ) {
+            curve_extended.push_back(subdived_curve[(ii+1)%N]);
+        }
+        // Else if it is on an edge
+        else if (std::get<2>(subdived_curve[(ii+1)%N])) {
+            curve_extended.push_back(subdived_curve[(ii+1)%N]);
+        }
+        // Else only if its further away from the previous point
+        else {
+            if (length(std::get<0>(subdived_curve[ii]) - std::get<0>(subdived_curve[(ii+1)%N])) > 1e-10) {
+                curve_extended.push_back(subdived_curve[(ii+1)%N]);
+            }
+        }
+    }
+
+    return curve_extended;
+
+}
 
 /* ----------------------------------------------------------------------- *
  * The purpose of this function is to cut up the base-patch faces according to the face-loop curves
@@ -3565,6 +3979,352 @@ bool does_the_base_patch_need_to_be_triangulated(std::vector<string> look_ahead,
 
 
     return need_triangulation;
+}
+
+
+
+// TC: The purpose of this function is to ensure that the faces selected from a face-loop border all faces selected from a base-patch.
+void match_base_patch_and_face_loop(Manifold &m, 
+                                    std::vector<std::tuple<HMesh::FaceSet, bool, bool, std::string, int>> &faces_2_be_extruded,
+                                    std::map<int, std::pair<int, std::tuple<HMesh::Manifold, 
+                                    HMesh::FaceSet, 
+                                    HMesh::FaceSet, 
+                                    std::map<HMesh::VertexID,CGLA::Vec2d>,
+                                    HMesh::VertexID, 
+                                    std::map<HMesh::FaceID, bool>,
+                                    HMesh::Manifold, 
+                                    std::vector<HMesh::HalfEdgeID>,
+                                    std::map<HMesh::VertexID,CGLA::Vec2d>
+                                        >>>& face_map) {
+  
+    //cout << "Inside match_base_patch_and_face_loop" << endl;
+
+    bool are_there_faces_from_face_loop = false;
+    bool are_there_faces_from_base_patch = false;
+
+    // Array to store all the candidate faces that we find
+    std::vector<HMesh::FaceSet> face_set_candidates;
+
+    // Array to store, which sets of faces we have checked up against each other. We don't need to check faces from base-patches,
+    // because we always know that they are okay, os it is mainly to check face-loop faces up against each other.
+    std::vector<bool> face_set_checked;
+    for (int ii = 0; ii < faces_2_be_extruded.size(); ii++) {
+        if (std::get<1>(faces_2_be_extruded[ii])) {
+            are_there_faces_from_base_patch = true;
+            face_set_checked.push_back(true);
+    
+            HMesh::FaceSet empty_set;
+            face_set_candidates.push_back(empty_set);
+        }
+        else {
+            are_there_faces_from_face_loop = true;
+            face_set_checked.push_back(false);
+
+            HMesh::FaceSet empty_set;
+            face_set_candidates.push_back(empty_set);
+        }
+    }
+
+    // Check that the face set to be extruded contains both faces from a base-patch and faces from a face-loop
+    if (are_there_faces_from_face_loop && are_there_faces_from_base_patch) {
+
+        // Check face-loop fs with respect to the base_patch_fs
+        for (int ii = 0; ii < faces_2_be_extruded.size(); ii++) {
+
+            // The Base-patch faces
+            auto& [base_patch_fs, is_inside_base_patch1, tmp1, tmp2, prev_ext1] = faces_2_be_extruded[ii];
+
+            // Check that faces come from a base_patch
+            if (is_inside_base_patch1) {
+
+                /*
+                cout << "Examining this base_patch_fs: " << endl;
+                for (auto f : base_patch_fs) {
+                    cout << f << " ";
+                }
+                cout << endl;
+                */
+                // We just store all the base-patch faces
+                for (auto f : base_patch_fs) {
+                    face_set_candidates[ii].insert(f);
+                }
+
+                HMesh::HalfEdgeID neighbour_edge;
+                auto bd_edges = boundary_hes(m, base_patch_fs);
+
+                // Then loop over the facesets which are face-loop faces
+                for (int jj = 0; jj < faces_2_be_extruded.size(); jj++) {
+
+                    auto &[face_loop_fs, is_inside_base_patch2, tmp1, tmp2, prev_ext2] = faces_2_be_extruded[jj];
+
+                    if (!is_inside_base_patch2 && prev_ext1 != prev_ext2) {
+                        
+                        /*
+                        cout << "Comparing it with this face_loop_fs: " << endl;
+                        for (auto f : face_loop_fs) {
+                            cout << f << " ";
+                        }
+                        cout << endl;
+                        */
+
+                        // Check whether the two facesets neighbour each other
+                        bool do_faces_neighbour = false;
+                        for (auto h : bd_edges) {
+                            if(face_loop_fs.find(m.walker(h).opp().face()) != face_loop_fs.end()) {
+                                do_faces_neighbour = true;
+                            }
+                        }
+                        if (do_faces_neighbour) {
+                            //cout << "The faces do neighbour each other" << endl;
+          
+
+                            HMesh::FaceSet new_face_loop_fs;
+                            // If the face_loop_fs is not checked, then new_face_loop_fs is initialized as empty. Otherwise, it is initizlied as as the previous fs
+      
+
+                            if (face_set_checked[jj]) {
+                                new_face_loop_fs = face_loop_fs;
+                            }
+
+
+                            auto tuple_value = face_map.find(prev_ext2)->second.second;
+                            auto all_face_loop_fs = std::get<1>(tuple_value);
+                            
+                            /*
+                            cout << "all_face_loop_fs are: " << endl;
+                            for (auto f : all_face_loop_fs) {
+                                cout << f << " ";
+                            }
+                            cout << endl;
+                            */
+
+                            // Include all those faces that neighbour a boundary edge
+                            for (auto h : bd_edges) { 
+                                auto f = m.walker(h).opp().face();
+                                if (all_face_loop_fs.find(f) != all_face_loop_fs.end()) {
+                                    //cout << "Inserting face: " << f << " into new_face_loop_fs" << endl;
+                                    new_face_loop_fs.insert(f);
+                                }
+                            }
+                            //cout << endl;
+
+                            face_set_checked[jj] = true;
+
+                            //cout << "This face-loop face set was checked" << endl;
+                            //cout.flush();
+
+                            for (auto f : new_face_loop_fs) {
+                                face_set_candidates[jj].insert(f);
+                            }
+
+                            //face_loop_fs = new_face_loop_fs;
+                        }
+                        else {
+                            for (auto f : face_loop_fs) {
+                                face_set_candidates[jj].insert(f);
+                            }
+                        }
+                    }
+                    
+                    else if (!is_inside_base_patch2 && prev_ext1 == prev_ext2) {
+                        for (auto f : face_loop_fs) {
+                            face_set_candidates[jj].insert(f);
+                        }
+                    }
+                    
+                }
+            }
+        }
+
+
+        /*
+        Now insert the faces that we just found above into the data-strucutre. If a set of face-loop faces did not neighbour base-patch faces,
+        then we just keep them as they are. If a set of face-loop faces is changed, then the we just store those changed faces.
+        */
+        for (int ii = 0; ii < faces_2_be_extruded.size(); ii++) {
+            //cout << "For Extrusion: " << ii << " the face_set_candidates are: " <<  endl;
+            auto& [fs, tmp0, tmp1, tmp2, tmp3] = faces_2_be_extruded[ii];
+            fs.clear();
+            for (auto f : face_set_candidates[ii]) {
+                fs.insert(f);
+                //cout << f << " ";
+            }
+            //cout << endl;
+        }
+    }
+
+
+    //cout << "Exiting match_base_patch_and_face_loop" << endl;
+    //cout.flush();
+    return;
+}
+
+HMesh::VertexID refind_the_ref_v(Manifold &m, std::vector<std::tuple<HMesh::FaceSet, bool, bool, std::string, int>> faces_2_be_extruded, HMesh::FaceSet fs, HMesh::VertexID ref_v,
+                                                                                                    std::map<int, std::pair<int, std::tuple<HMesh::Manifold, 
+                                                                                                    HMesh::FaceSet, 
+                                                                                                    HMesh::FaceSet, 
+                                                                                                    std::map<HMesh::VertexID,CGLA::Vec2d>,
+                                                                                                     HMesh::VertexID, 
+                                                                                                     std::map<HMesh::FaceID, bool>,
+                                                                                                     HMesh::Manifold, 
+                                                                                                    std::vector<HMesh::HalfEdgeID>,
+                                                                                                    std::map<HMesh::VertexID,CGLA::Vec2d>
+                                                                                                     >>>& face_map) {
+
+    HMesh::VertexSet bd_verts = boundary_verts(m, fs);
+
+    //cout << "Inside refind_the_ref_v, ref_v is: " << ref_v << endl;
+
+    // The reference vertex is not on the boundary, so we need to find it.
+    if (bd_verts.find(ref_v) == bd_verts.end()) {
+ 
+        for (auto it : faces_2_be_extruded) {
+
+            // std::vector<std::tuple<HMesh::FaceSet, bool, bool, std::string, int>>
+            /*
+            cout << "fs in refind_the_ref_v: ";
+            for (auto f : std::get<0>(it)) {
+                cout << f << " ";
+            }
+            cout << endl;
+            cout << "Is this the one in charge of the boundary vertex? " << std::get<2>(it) << endl;
+            */
+
+            if (std::get<2>(it)) { // This is the one in charge of the boundary vertex
+
+                Generic_Extrusion gen_ext;
+
+                /*
+                cout << "fs in refind_the_ref_v: ";
+                for (auto f : fs) {
+                    cout << f << " ";
+                }
+                cout << endl;
+                */
+
+                // Find the correct faces
+                HMesh::FaceSet fs_ref_v_responsible;
+                for (auto f : std::get<0>(it)) {
+                    if (fs.find(f) != fs.end()) {
+                        //cout << f << " ";
+                        fs_ref_v_responsible.insert(f);
+                    }
+                }
+                //cout << endl;
+                int prev_extrusion_name = std::get<4>(it);
+                auto tuple_value = face_map.find(prev_extrusion_name)->second.second;
+                Manifold m_state = std::get<0>(tuple_value);
+                map<HMesh::VertexID,CGLA::Vec2d> vertex_uv_map = std::get<3>(tuple_value);
+
+                // Find the ref_v
+                auto bd_v_index = HMesh::VertexID(stoi(std::get<3>(it)));
+   
+                auto bd_v_coordinates = gen_ext.get_vertex_uv_map().find(bd_v_index)->second;
+          
+                
+                // If it is on a base_patch
+                std::vector<HMesh::VertexID> peak_bd_vertices;
+                
+                if (std::get<1>(it)) {
+      
+                    auto local_bd_verts = boundary_verts(m_state, fs_ref_v_responsible);
+                    for (auto v : local_bd_verts) {
+                        if (bd_verts.find(v) != bd_verts.end()) { // To make sure that it is actually on the boundary of the entire faceset
+                            peak_bd_vertices.push_back(v);
+                        }
+                    }
+                }
+                // It is on a face-loop
+                else {
+            
+                    double cutoff = 2.5;
+                    auto [angle, new_ref_v, local_bd_verts] = compute_new_bd_v_with_high_curvature(m_state, fs_ref_v_responsible, vertex_uv_map, boundary_hes(m_state, fs_ref_v_responsible), cutoff);
+                    for (auto it : local_bd_verts) {
+                        auto v = it.first;
+                        if (bd_verts.find(v) != bd_verts.end()) { // To make sure that it is actually on the boundary of the entire faceset
+                            peak_bd_vertices.push_back(v);
+                        }
+                    }
+                }
+                
+                double min_dist = std::numeric_limits<double>::infinity();
+                for (auto v : peak_bd_vertices) {
+                    auto dist = length(vertex_uv_map.find(v)->second - bd_v_coordinates);
+                 
+                    if (dist < min_dist) {
+                        min_dist = dist;
+                        ref_v = v;
+                    }
+                }
+            }
+
+            
+        }
+
+    }
+
+    return ref_v;
+}
+
+
+std::pair<HMesh::FaceSet, HMesh::VertexID> fix_face_issues(HMesh::Manifold &m, 
+                                                            HMesh::VertexID bd_v, 
+                                                            std::vector<std::tuple<HMesh::FaceSet, bool, bool, std::string, int>> &faces_2_be_extruded,
+                                                            std::map<int, std::pair<int, std::tuple<HMesh::Manifold, 
+                                                                                                    HMesh::FaceSet, 
+                                                                                                    HMesh::FaceSet, 
+                                                                                                    std::map<HMesh::VertexID,CGLA::Vec2d>,
+                                                                                                    HMesh::VertexID, 
+                                                                                                    std::map<HMesh::FaceID, bool>,
+                                                                                                    HMesh::Manifold, 
+                                                                                                    std::vector<HMesh::HalfEdgeID>,
+                                                                                                    std::map<HMesh::VertexID,CGLA::Vec2d>
+                                                                                                     >>>& face_map) {
+
+    
+
+    HMesh::FaceSet prev_face_set = extract_face_set(faces_2_be_extruded);
+
+    
+    if (prev_face_set.size() == 0) {
+        return {prev_face_set, bd_v};
+    }
+    
+    prev_face_set = check_faceset_connectivity(m, prev_face_set);
+    for (auto &it : faces_2_be_extruded) {
+        HMesh::FaceSet faces_2_erase;
+        for (auto f : std::get<0>(it)) {
+            if (prev_face_set.find(f) == prev_face_set.end()) {
+                faces_2_erase.insert(f);
+            }
+        }
+        for (auto f : faces_2_erase) {
+            std::get<0>(it).erase(f);
+        }
+    }
+
+    std::vector<int> elements_to_remove;
+    for (int ii = 0; ii < faces_2_be_extruded.size(); ii++) {
+        if (std::get<0>(faces_2_be_extruded[ii]).empty()) {
+            elements_to_remove.push_back(ii);
+        }
+    }
+    std::sort(elements_to_remove.rbegin(), elements_to_remove.rend());
+    for (size_t i : elements_to_remove) {
+        faces_2_be_extruded.erase(faces_2_be_extruded.begin() + i);
+    }
+  
+    match_base_patch_and_face_loop(m, faces_2_be_extruded, face_map);
+
+    close_holes_in_fs(m, faces_2_be_extruded, face_map);
+    HMesh::FaceSet face_set = extract_face_set(faces_2_be_extruded);
+    if (prev_face_set != face_set) {
+        bd_v = HMesh::InvalidVertexID;
+    }
+ 
+    bd_v = refind_the_ref_v(m, faces_2_be_extruded, face_set, bd_v, face_map);
+
+    return {face_set, bd_v};
 }
 
 

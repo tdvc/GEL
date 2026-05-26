@@ -20,8 +20,9 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Darwin")
     set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64" CACHE STRING "Build architectures for MacOS" FORCE)
 endif ()
 
-
-# Libigl
+# --------------------------------
+# download libigl
+# --------------------------------
 include(FetchContent)
 FetchContent_Declare(
     libigl
@@ -31,6 +32,18 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(libigl)
 set(LIBIGL_WITH_TRIANGLE ON)
 set(LIBIGL_WITH_CGAL ON CACHE BOOL "Enable CGAL in libigl")
+
+
+# --------------------------------
+# download nanoflann
+# --------------------------------
+FetchContent_Declare(
+  nanoflann
+  GIT_REPOSITORY https://github.com/jlblancoc/nanoflann.git
+  GIT_TAG master
+)
+
+FetchContent_MakeAvailable(nanoflann)
 
 # Eigen library
 find_package(Eigen3 3.3 REQUIRED)

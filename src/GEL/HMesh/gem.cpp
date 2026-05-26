@@ -95,6 +95,28 @@ HMesh::VertexSet all_verts(const HMesh::Manifold& m, const HMesh::FaceSet& fs) {
 }
 
 /* ----------------------------------------------------------------------- *
+ * Finds all the interior vertices on a set of faces
+ * ----------------------------------------------------------------------- */
+HMesh::VertexSet find_interior_vertices(const HMesh::Manifold &m, HMesh::FaceSet patch_faces) {
+    HMesh::VertexSet interior_verts;
+
+    // Get all the vertices in the patch
+    HMesh::VertexSet all_patch_verts = all_verts(m, patch_faces);
+
+    // Get the boundary vertices
+    HMesh::VertexSet bd_verts = boundary_verts(m, patch_faces);
+
+    // The interior vertices are those that are not on the boundary
+    for (auto v : all_patch_verts) {
+        if (bd_verts.find(v) == bd_verts.end()) {
+            interior_verts.insert(v);
+        }
+    }
+
+    return interior_verts;
+}
+
+/* ----------------------------------------------------------------------- *
  * Finds all the boundary vertices of a set of faces (fs)
  * ----------------------------------------------------------------------- */
 HMesh::VertexSet boundary_verts(const HMesh::Manifold& m, const HMesh::FaceSet& fs) {
@@ -270,6 +292,217 @@ HMesh::FaceSet check_faceset_connectivity(HMesh::Manifold &m, HMesh::FaceSet fac
     }
 
     return largest_face_group;
+}
+
+
+// The purpose of this function is to track boundary loops given boundary edges
+std::vector<std::vector<HMesh::HalfEdgeID>> find_boundary_edge_loops(HMesh::Manifold &m, HMesh::FaceSet face_set, HMesh::HalfEdgeSet bd_edges) {
+    std::vector<std::vector<HMesh::HalfEdgeID>> bd_loops;
+
+    std::vector<HMesh::HalfEdgeID> edge_loop; 
+
+
+    do {
+        auto edge_begin = *bd_edges.begin();
+
+        edge_loop.clear();
+        edge_loop.push_back(edge_begin);
+        
+        HMesh::HalfEdgeID next_edge;
+        auto incident_vertex = m.walker(edge_begin).vertex();
+        circulate_vertex_ccw(m, incident_vertex, [&] (HalfEdgeID h) {
+            if (bd_edges.find(h) != bd_edges.end()) {
+                next_edge = h;
+            }
+        }); 
+        
+        while (next_edge != edge_begin && !bd_edges.empty()) {
+ 
+            edge_loop.push_back(next_edge);
+
+            auto incident_vertex = m.walker(next_edge).vertex();
+            circulate_vertex_ccw(m, incident_vertex, [&] (HalfEdgeID h) {
+                if (bd_edges.find(h) != bd_edges.end()) {
+                    next_edge = h;
+                }
+            });
+        }
+        for (auto h : edge_loop) {
+            bd_edges.erase(h);
+        }
+
+
+        bd_loops.push_back(edge_loop);
+
+        if (bd_edges.empty()) {
+            break;
+        }
+    } while(true);
+
+    return bd_loops;
+}
+
+
+// Ensure that the the face_set has disk topology, so there are no holes in the middle. If there is a hole in the middle, 
+// we add the faces that make up the hole in the middle to the face_set
+HMesh::FaceSet check_topology(HMesh::Manifold &m, HMesh::FaceSet face_set) {
+
+    HMesh::FaceSet new_face_set;
+    for (auto f : face_set) {
+        new_face_set.insert(f);
+    }
+
+    // As a first step, just add all of those faces of m, which are not in face_set, but only has neighbouring faces in face_set. These should be added anyway
+    for (auto f : m.faces()) {
+
+        // Check that it is not already in the set
+        if (face_set.find(f) == face_set.end()) {
+            bool should_be_included = true;
+            circulate_face_ccw(m, f, [&] (FaceID fn) {
+                if (face_set.find(fn) == face_set.end()) {
+                    // One neighbour face was not in face_set, so we do not included, because it is not totally sourrounded
+                    should_be_included = false;
+                }
+            }); 
+            if (should_be_included) {
+                new_face_set.insert(f); // We add the face
+            }
+        }
+    }
+
+    // As a second step: There might be a triangle in the faceset, which has a vertex on the boundary, and if that is the case, then it should be included.
+    // It also causes an error, when we try to find the boundary edges from a vertex, which causes the code to crash. This problem can be solved in two different ways: 
+    // 1) Find the boundary edges of the face-set and detect, if any vertex appears twice
+    // 2) Find any triangle face that has neighbours in the face-set and then ensure that the vertex is on the boundary. 
+    // Based on this 1) seems like the best solution
+    auto bd_edges = boundary_hes(m, new_face_set);
+    std::map<HMesh::VertexID, std::vector<HMesh::HalfEdgeID>> v_to_h_map;
+    for (auto h : bd_edges) {
+        auto v = m.walker(h).vertex();
+        if (v_to_h_map.find(v) == v_to_h_map.end()) {
+            std::vector<HMesh::HalfEdgeID> tmp = {h};
+            v_to_h_map.insert(std::make_pair(v, tmp));
+        }
+        else {
+            v_to_h_map.find(v)->second.push_back(h);
+        }
+    }
+    // Loop through all those entries that have 2 edges
+    HMesh::FaceSet potential_fs;
+    for (auto it : v_to_h_map) {
+        // We found a vertex that appears twice
+        if (it.second.size() == 2) {
+            //cout << "Vertex: " << it.first << " has a face that is not included " << endl;
+            //cout.flush();
+            // Circulate all the faces of the vertex and include the face, which has two edges whose opposite edges are in bd_edges
+            circulate_vertex_ccw(m, it.first, [&] (FaceID fn) {
+                // Ensure that the face is not already in the face set
+                if (new_face_set.find(fn) == new_face_set.end()) {
+                    int counter = 0;
+                    circulate_face_ccw(m, fn, [&] (HalfEdgeID h) {
+                        auto opp_h = m.walker(h).opp().halfedge();
+                        if (bd_edges.find(opp_h) != bd_edges.end()) {
+                            counter += 1;
+                        }
+                    }); 
+                    if (counter == 2) {
+                        //cout << "Adding face fn " << fn << " because it was on the boundary " << endl;
+                        //cout.flush();
+                        new_face_set.insert(fn);
+                    }
+                }
+            }); 
+        }
+    }
+
+    bd_edges = boundary_hes(m, new_face_set);
+
+    auto bd_loops = find_boundary_edge_loops(m, new_face_set, bd_edges);
+
+    while (bd_loops.size() != 1) {
+
+        double min_size = std::numeric_limits<double>::infinity();
+        std::vector<HMesh::HalfEdgeID> smallest_edge_loop;
+        for (auto edge_loop : bd_loops) {
+
+            if (double(edge_loop.size()) < min_size) {
+                min_size = double(edge_loop.size()); 
+                smallest_edge_loop = edge_loop;
+            }
+        }
+
+        for (auto h : smallest_edge_loop) {
+            new_face_set.insert(m.walker(h).face());
+            new_face_set.insert(m.walker(h).opp().face());
+        }
+        bd_edges = boundary_hes(m, new_face_set);
+
+        bd_loops = find_boundary_edge_loops(m, new_face_set, bd_edges);
+
+    }
+
+    return new_face_set;
+}
+
+HMesh::FaceSet extract_face_set(std::vector<std::tuple<HMesh::FaceSet, bool, bool, std::string, int>>& faces_2_be_extruded) {
+    
+    HMesh::FaceSet fs;
+    for (auto it : faces_2_be_extruded) {
+        for (auto f : std::get<0>(it)) {
+            fs.insert(f);
+        }
+    }
+    return fs;
+}
+
+void close_holes_in_fs(HMesh::Manifold &m, 
+                        std::vector<std::tuple<HMesh::FaceSet, bool, bool, std::string, int>> &faces_2_be_extruded,
+                        std::map<int, std::pair<int, std::tuple<HMesh::Manifold, 
+                                                                                                    HMesh::FaceSet, 
+                                                                                                    HMesh::FaceSet, 
+                                                                                                    std::map<HMesh::VertexID,CGLA::Vec2d>,
+                                                                                                    HMesh::VertexID, 
+                                                                                                    std::map<HMesh::FaceID, bool>,
+                                                                                                    HMesh::Manifold, 
+                                                                                                    std::vector<HMesh::HalfEdgeID>,
+                                                                                                    std::map<HMesh::VertexID,CGLA::Vec2d>
+                                                                                                    >>>& face_map) {
+
+
+
+    HMesh::FaceSet fs = extract_face_set(faces_2_be_extruded);
+    HMesh::FaceSet new_fs = check_topology(m, fs);
+
+    //cout << "Size of fs: " << fs.size() << endl;
+    //cout << "Size of new_fs: " << new_fs.size() << endl;
+    HMesh::FaceSet added_faces;
+    std::set_difference(
+        new_fs.begin(), new_fs.end(),
+        fs.begin(), fs.end(),
+        std::inserter(added_faces, added_faces.begin())
+    );
+
+    // Figure out which faces_2_be_extruded the added faces belong to
+    for (auto f : added_faces) {
+        //cout << "This face has been added: " << f << endl;
+
+        for (auto &it : faces_2_be_extruded) {
+            auto tuple_value = face_map.find(std::get<4>(it))->second.second;
+            
+            auto face_loop_faces = std::get<1>(tuple_value);
+            auto base_patch_faces = std::get<2>(tuple_value);
+
+            if (base_patch_faces.find(f) != base_patch_faces.end() && std::get<1>(it)) {
+                std::get<0>(it).insert(f);
+            }
+            else if (face_loop_faces.find(f) != face_loop_faces.end() && !std::get<1>(it)) {
+                std::get<0>(it).insert(f);
+            }
+            else {
+                //cout << "Could not add face: " << f << endl;
+            }
+        }
+    }
 }
 
 
@@ -723,6 +956,41 @@ HMesh::FaceID find_shared_face(HMesh::Manifold &m, HMesh::VertexID v1, HMesh::Ve
 }
 
 /* ----------------------------------------------------------------------- *
+ * Check if the two vertices can be connected
+ * ----------------------------------------------------------------------- */
+bool vertex_vertex_connection(HMesh::Manifold m, HMesh::VertexID v1, HMesh::VertexID v2) {
+    if (are_vertices_connected(m, v1, v2)) {
+        return true;
+    }
+    else {
+        auto shared_face = find_shared_face(m, v1, v2);
+        if (shared_face == HMesh::InvalidFaceID) {
+            return false;
+        }
+        else {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* ----------------------------------------------------------------------- *
+ * Check if a vertex can be connected to a point on an edge h
+ * ----------------------------------------------------------------------- */
+bool vertex_edge_connection(HMesh::Manifold m, HMesh::VertexID v1, HMesh::HalfEdgeID h) {
+
+    HMesh::FaceSet fs;
+    circulate_vertex_ccw(m, v1, [&](FaceID fn) {
+        fs.insert(fn);
+    });
+    auto edges = extended_patch_edges(m, fs);
+    if (edges.find(h) != edges.end()) {
+        return true;
+    }
+    return false;
+}
+
+/* ----------------------------------------------------------------------- *
  * Find the area of a 2D polygon, where the vertices are given by a Nx2 matrix
  * ----------------------------------------------------------------------- */
 double area_of_polygon(Eigen::MatrixXd curr_loop_V) {
@@ -1070,9 +1338,43 @@ std::pair<HMesh::HalfEdgeID, double> locate_point_on_edge(HMesh::Manifold&m, std
         }
     }
     return {edge, s};
-} 
+}
 
+bool vertex_face_connection(HMesh::Manifold m, HMesh::FaceSet base_patch_faces, std::map<HMesh::VertexID, CGLA::Vec2d>& v_uv_map, HMesh::VertexID v1, CGLA::Vec2d p) {
+    
+    auto [f_to_split, tmp1, tmp2, tmp3, alpha, beta, gamma] = locate_point_in_face(m, base_patch_faces, v_uv_map, p);
 
+    HMesh::FaceSet fs;
+    circulate_vertex_ccw(m, v1, [&](FaceID fn) {
+        fs.insert(fn);
+    });
+    if (fs.find(f_to_split) != fs.end()) {
+        return true;
+    }
+    return false;
+}
+
+CGLA::Vec3d compute_new_v_pos_3d(HMesh::Manifold &m_copy, HMesh::FaceSet& base_patch_faces_copy, std::map<HMesh::VertexID, CGLA::Vec2d>& v_uv_map_copy, CGLA::Vec2d new_v_uv) {
+
+    auto [f_to_split, v1, v2, v3, alpha, beta, gamma] = locate_point_in_face(m_copy, base_patch_faces_copy, v_uv_map_copy, new_v_uv);
+
+    // Compute the new position
+    CGLA::Vec3d new_pos_3d = alpha * m_copy.pos(v1) + beta * m_copy.pos(v2) + gamma * m_copy.pos(v3);
+
+    // Split the face
+    auto new_v = m_copy.split_face_by_vertex(f_to_split); 
+
+    v_uv_map_copy.insert(std::make_pair(new_v, new_v_uv));
+
+    base_patch_faces_copy.erase(f_to_split);
+    circulate_vertex_ccw(m_copy, new_v, [&] (HMesh::FaceID fn) {
+        if (fn != HMesh::InvalidFaceID) {
+            base_patch_faces_copy.insert(fn);
+        }
+    });
+
+    return new_pos_3d;
+}
 
 void delaunay_triangulate_each_single_face2(HMesh::Manifold &m, HMesh::Manifold &m_copy, HMesh::FaceSet& base_patch_faces, HMesh::FaceSet& base_patch_faces_copy, std::map<HMesh::VertexID, CGLA::Vec2d>& v_uv_map, std::map<HMesh::VertexID, CGLA::Vec2d>& v_uv_map_copy, std::vector<std::tuple<int, HMesh::FaceSet, HMesh::VertexID, bool, std::vector<HMesh::VertexID>>> &curve_enclosed_faces, std::map<HMesh::VertexID, std::tuple<CGLA::Vec2d, HMesh::VertexID, HMesh::VertexID, double>>& new_vertices) {
 
@@ -1256,3 +1558,5 @@ void delaunay_triangulate_each_single_face2(HMesh::Manifold &m, HMesh::Manifold 
 
 
 }
+
+
