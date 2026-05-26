@@ -16,6 +16,23 @@ using namespace Geometry;
 using namespace HMesh;
 using namespace Eigen;
 
+// nanoflann kDTree
+using Matrix2D = Eigen::Matrix<double, Eigen::Dynamic, 2>;
+using nano_KDTree = nanoflann::KDTreeEigenMatrixAdaptor<Matrix2D, 2>;
+
+static void rebuildMatrix(
+    const std::vector<CGLA::Vec2d>& points,
+    Matrix2D& mat)
+{
+    mat.resize(points.size(), 2);
+
+    for (size_t i = 0; i < points.size(); ++i)
+    {
+        mat(i, 0) = points[i][0];
+        mat(i, 1) = points[i][1];
+    }
+}
+
 // A global variable
 std::map<int,Extrusion> extrusion_tree;
 // Variable to store, whether a face is part of the base-base patch, or is on a face-loop

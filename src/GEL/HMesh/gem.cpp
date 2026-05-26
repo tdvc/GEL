@@ -1560,3 +1560,114 @@ void delaunay_triangulate_each_single_face2(HMesh::Manifold &m, HMesh::Manifold 
 }
 
 
+// Use Minimum Spanning Tree to find the yellow faces that will be extruded
+MST::MST(HMesh::Manifold mesh, HMesh::FaceSet& face_set, std::map<HMesh::VertexID, CGLA::Vec2d>& v_uv_map, Eigen::MatrixXd curr_loop_V) {
+
+    m = mesh;
+
+    for (auto f : m.faces()) {
+        if (face_set.find(f) == face_set.end()) {
+            m.remove_face(f);
+        }
+    }
+    for (auto v : m.vertices()) {
+        m.pos(v) = CGLA::Vec3d(v_uv_map.find(v)->second[0], 0.0, v_uv_map.find(v)->second[1]);
+    }
+    
+
+    vertex_uv_map = v_uv_map;
+
+    curve = curr_loop_V;
+
+    curr_ext_faces.clear();
+    for (auto f : face_set) {
+        curr_ext_faces.insert(f);
+    }
+
+    // Find face loop faces and base patch faces
+    HMesh::FaceSet face_loop_faces;
+    HMesh::FaceSet base_patch_faces;
+    auto bd_edges = boundary_hes(m, curr_ext_faces);
+    for (auto h : bd_edges) {
+        face_loop_faces.insert(m.walker(h).face());
+    }
+    for (auto f : curr_ext_faces) {
+        if (face_loop_faces.find(f) == face_loop_faces.end()) {
+            base_patch_faces.insert(f);
+        }
+    }
+
+    // Insert the vertices in the patch 
+    HMesh::VertexSet verts = all_verts(m, base_patch_faces);
+    for (auto v : verts) {
+        components.insert(std::make_pair(v, v));
+    }
+
+    allowable_edges = all_edges(m, base_patch_faces);
+    bd_edges = boundary_hes(m, base_patch_faces);
+    for (auto h : bd_edges) {
+        allowable_edges.insert(m.walker(h).opp().halfedge());
+    }
+
+    // Insert the curve points into the tree
+    int no_curve_points = curve.rows();
+    int counter = 0;
+    for (int ii = 0; ii < no_curve_points; ii++) {
+        Eigen::RowVectorXd row1 = curve.row(ii);  // extracts row as RowVectorXd
+        CGLA::Vec2d p1(row1(0), row1(1));
+
+        Eigen::RowVectorXd row2 = curve.row((ii+1)%no_curve_points);  // extracts row as RowVectorXd
+        CGLA::Vec2d p2(row2(0), row2(1));
+
+        std::vector<std::vector<double>> curve_segment;
+
+        for (int t = 0; t < no_edge_points; t++) {
+            CGLA::Vec2d edge_point = p1 + (p2 - p1) * (static_cast<double>(t) / static_cast<double>(no_edge_points));
+            
+            // Find the edge vector
+            CGLA::Vec2d edge_vector = p2 - p1;
+            // Take care if we are at a corner point (just add the two edge vectors together)
+            if (t == 0) {
+                Eigen::RowVectorXd prev_row1 = curve.row((ii-1+no_curve_points)%no_curve_points);  // extracts row as RowVectorXd
+                CGLA::Vec2d prev_p1(prev_row1(0), prev_row1(1));
+
+                Eigen::RowVectorXd prev_row2 = curve.row(ii);  // extracts row as RowVectorXd
+                CGLA::Vec2d prev_p2(prev_row2(0), prev_row2(1));
+                edge_vector += prev_p2 - prev_p1; // Add the previous edge vector to the current one
+            }
+            edge_vector.normalize();
+            // Rotate the edge vector by 90 degrees to get the normal vector
+            CGLA::Vec2d normal_vector(-edge_vector[1], edge_vector[0]);
+            // Get the gradient vector as the negative normal vector
+            CGLA::Vec2d gradient_vector = -normal_vector;
+            gradient_vector.normalize();
+            gradient_vectors.insert(std::make_pair(counter, gradient_vector));
+            //gradient_vectors.insert(std::make_pair(counter, edge_vector));
+
+            // Insert the edge point into the curve tree
+            //cout << "Inserting edge point: [" << edge_point[0] << ", " << edge_point[1] << "] with counter " << counter << endl;
+            curve_tree.insert(edge_point, counter);
+
+            // Insert the edge point into the ground truth curve
+            std::vector<double> element;
+            element.push_back(edge_point[0]);
+            element.push_back(edge_point[1]);
+
+            // Insert computed point on the curve segment into the vector containing all points of the curve
+            gt_curve.push_back(element);
+
+            // Insert computed point on the curve segment into the vector containing the points on that curve segment
+            curve_segment.push_back(element);
+
+            counter += 1;
+        }
+
+        // Insert segment of curve into the vector containing all segments of the ground truth curve
+        gt_curve_segments.push_back(curve_segment);
+    }
+    curve_tree.build();
+
+
+    // Remove entries in minimum spanning tree that are not connected to the curve
+    mst_edges.clear();
+}

@@ -45,6 +45,29 @@ FetchContent_Declare(
 
 FetchContent_MakeAvailable(nanoflann)
 
+# --------------------------------
+# download dtaidistance
+# --------------------------------
+FetchContent_Declare(
+  dtaidistance
+  GIT_REPOSITORY https://github.com/wannesm/dtaidistance.git
+  GIT_TAG master
+)
+
+FetchContent_GetProperties(dtaidistance)
+if(NOT dtaidistance_POPULATED)
+  FetchContent_Populate(dtaidistance)
+endif()
+
+add_library(dtaidistance_c STATIC
+  ${dtaidistance_SOURCE_DIR}/src/dtaidistance/lib/DTAIDistanceC/DTAIDistanceC/dd_dtw.c
+  ${dtaidistance_SOURCE_DIR}/src/dtaidistance/lib/DTAIDistanceC/DTAIDistanceC/dd_ed.c
+)
+
+target_include_directories(dtaidistance_c PUBLIC
+  ${dtaidistance_SOURCE_DIR}/src/dtaidistance/lib/DTAIDistanceC/DTAIDistanceC
+)
+
 # Eigen library
 find_package(Eigen3 3.3 REQUIRED)
 include_directories(${EIGEN3_INCLUDE_DIR})
@@ -103,10 +126,10 @@ if (Use_GLGraphics)
     list(APPEND GLG_SRC_LIST ${GLG_SRC_LIST_CPP} ${GLG_SRC_LIST_C})
     target_sources(GEL PRIVATE ${GL_SRC_LIST} ${GLG_SRC_LIST} ${CGLA_SRC_LIST} ${GEO_SRC_LIST} ${MESH_SRC_LIST} ${UTIL_SRC_LIST})
     target_include_directories(GEL PRIVATE ./src/GEL/GL/include)
-    target_link_libraries(GEL PRIVATE Threads::Threads OpenGL::GLU OpenGL::GL ${COCOA_LIBRARY} nanoflann::nanoflann igl::core)
+    target_link_libraries(GEL PRIVATE Threads::Threads OpenGL::GLU OpenGL::GL ${COCOA_LIBRARY} nanoflann::nanoflann dtaidistance_c igl::core)
 else ()
     target_sources(GEL PRIVATE ${CGLA_SRC_LIST} ${GEO_SRC_LIST} ${MESH_SRC_LIST} ${UTIL_SRC_LIST})
-    target_link_libraries(GEL PRIVATE Threads::Threads nanoflann::nanoflann igl::core)
+    target_link_libraries(GEL PRIVATE Threads::Threads nanoflann::nanoflann dtaidistance_c igl::core)
 endif ()
 
 # Locate the sources for PyGEL
