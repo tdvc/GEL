@@ -63,7 +63,7 @@ Eigen::MatrixXd read_MatrixXd(ifstream& extrusion_file) {
 /* ----------------------------------------------------------------------- *
  * Function which loads an extrusion
  * ----------------------------------------------------------------------- */
-Extrusion load_extrusion(string file_name) {
+Extrusion load_extrusion(std::string file_name) {
     // The loaded extrusion:
     Extrusion ext;
     

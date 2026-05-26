@@ -7,6 +7,7 @@
 #include <GEL/HMesh/extrusion.h>
 #include <GEL/HMesh/HMesh.h>
 #include <GEL/HMesh/Manifold.h>
+#include <igl/winding_number.h>
 
 using namespace std;
 using namespace CGLA;
@@ -18,6 +19,7 @@ using namespace Eigen;
 std::map<int,Extrusion> extrusion_tree;
 // Variable to store, whether a face is part of the base-base patch, or is on a face-loop
 std::map<HMesh::FaceID, bool> face_patch_flag;
+
 
 /* ----------------------------------------------------------------------- *
  * TC: This function checks, whether a face-loop is self-adjacent. It basically means that for a face-loop on a FEQ-mesh, 
@@ -2017,7 +2019,94 @@ Eigen::MatrixXd find_yellow_loop(Generic_Extrusion& gen_ext, std::vector<HMesh::
     return fs_loop;
 }
 
+std::tuple<HarmonicMap,  std::map<HMesh::VertexID, CGLA::Vec3d>, std::map<HMesh::VertexID, CGLA::Vec2d>> geometric_extrude_face_set_hmap_perim_normalized(Manifold& m, const Extrusion ext, FaceSet interior_faces, HarmonicMap source_hmap, double tgt_bd_perim, double src_bd_perim, int extrusion_counter) {
 
+    // Variables needed for the re-extrusion
+
+    std::map<HMesh::VertexID, CGLA::Vec3d> bd_v_positions;
+    std::map<HMesh::VertexID, CGLA::Vec2d> prev_v_uv_map;
+
+    string hmap_name = "geometric_extrude_hmap_" + to_string(ext.id);
+    HarmonicMap target_hmap(m, interior_faces, ext.bd_v, hmap_name);
+
+    auto npos = m.positions_attribute_vector();
+
+    VertexAttributeVector<double> weights(m.no_vertices(), 0.0);
+
+    VertexSet patch_verts = all_verts(m, interior_faces);
+    VertexSet bd_verts = boundary_verts(m, interior_faces);
+
+    for (auto bd_v : bd_verts) { 
+        bd_v_positions.insert({bd_v, m.pos(bd_v)});
+    }
+    for (auto v : patch_verts) {
+        prev_v_uv_map.insert({v, target_hmap.patch_vertex_uv(v)});
+    }
+
+   // TC: target_hmap is the one that is different from the hmap on the decomposed shape. So we have an hmap on the decomposed shape, and then
+   // we have an hmap on the reconstructed shape. Source-map is the one from the extrusion, target-map is the one computed on the shape, we are about to
+   // reconstruct
+
+   // ------------------------------------------------------------------
+    // Karran's method
+    // ------------------------------------------------------------------
+    
+    double eps = 1e-15;
+    VertexAttributeVector<int> touched(m.no_vertices(),0);
+
+    for (auto bd_v : bd_verts) {
+
+        Vec3d curr_bd_vert = m.pos(bd_v);
+        //cout << "curr_bd_vert: " << curr_bd_vert << endl;
+
+        Vec2d bd_uv = target_hmap.patch_vertex_uv(bd_v);
+
+        Mat3x3d curr_bd_frame = target_hmap.get_patch_frame(curr_bd_vert);
+
+        auto curr_npos = m.positions_attribute_vector();
+
+        Vec3d source_bd_pt = source_hmap.uv_to_vertex(bd_uv);
+
+        Mat3x3d source_bd_frame = source_hmap.get_patch_frame(source_bd_pt);
+
+        int i = 0;
+
+        for (auto v : patch_verts) {
+
+            Vec3d curr_pt = m.pos(v);
+
+            Vec2d curr_uv = target_hmap.patch_vertex_uv(v);
+
+            Vec3d disp_vec = source_hmap.interp_disp_vec_extended(curr_uv, source_bd_pt);
+
+            disp_vec *= (tgt_bd_perim/src_bd_perim);
+
+            curr_npos[v] = curr_bd_vert + transpose(curr_bd_frame)*source_bd_frame*disp_vec; //length(curr_bd_vert - centre(m,ext.origin_face))*
+
+            if (!touched[v]) {
+                npos[v] = curr_npos[v];
+                touched[v] = 1;
+            }
+            else {
+                npos[v] += curr_npos[v];
+            }
+
+            weights[v] += 1.0;// += weight;
+            i++;
+        }
+   }
+
+    for (auto v : patch_verts) {
+      //cout<<num_verts[v]<<endl;
+      if(weights[v] > eps) {
+        npos[v] /= weights[v];
+      }
+    }
+
+    m.positions_attribute_vector() = npos;
+
+    return {target_hmap, bd_v_positions, prev_v_uv_map};
+}
 
 /* ----------------------------------------------------------------------- *
  * Code to perform the actual extrusion
@@ -2196,6 +2285,764 @@ std::tuple<HarmonicMap, std::map<HMesh::VertexID, CGLA::Vec3d>, std::map<HMesh::
     vertex_uv_map = hmap.get_v_uv_map(m, extrusion_name, true);
 
     return result;
+}
+
+
+void geometric_extrude_new_vertices(Manifold& m, const Extrusion ext, HarmonicMap target_hmap, double tgt_bd_perim, std::map<HMesh::VertexID, CGLA::Vec3d> bd_v_positions, std::map<HMesh::VertexID, std::tuple<CGLA::Vec2d, HMesh::VertexID, HMesh::VertexID, double>> new_vertices) {
+    
+    //cout << "Inside geometric_extrude_new_vertices" << endl;
+
+    double src_bd_perim = ext.scale;
+
+    auto npos = m.positions_attribute_vector();
+
+    VertexAttributeVector<double> weights(m.no_vertices(), 0.0);
+
+    // -----------------------
+    // source harmonic map
+    // -----------------------
+    stack<HarmonicMap> transform_stack = ext.hmap_stack;
+    auto source_hmap = transform_stack.top();
+
+    auto curr_npos = m.positions_attribute_vector();
+    auto prev_npos = m.positions_attribute_vector();
+
+
+    double eps = 1e-15;
+    VertexAttributeVector<int> touched(m.no_vertices(),0);
+
+    for (auto iter : bd_v_positions) {
+
+        auto bd_v = iter.first;
+
+        Vec3d curr_bd_vert = iter.second;
+
+        Vec2d bd_uv = target_hmap.patch_vertex_uv(bd_v);
+
+        Mat3x3d curr_bd_frame = target_hmap.get_patch_frame(curr_bd_vert);
+
+        auto curr_npos = m.positions_attribute_vector();
+
+        Vec3d source_bd_pt = source_hmap.uv_to_vertex(bd_uv);
+
+        Mat3x3d source_bd_frame = source_hmap.get_patch_frame(source_bd_pt);
+
+        int i = 0;
+
+        for (auto it : new_vertices) {
+
+            auto v = it.first;
+            auto [v_uv, vA, vB, s] = it.second;
+
+            Vec3d curr_pt = m.pos(v);
+
+            Vec2d curr_uv = v_uv;
+
+            Vec3d disp_vec;
+        
+            disp_vec = source_hmap.interp_disp_vec_extended(curr_uv, source_bd_pt);
+
+            disp_vec *= (tgt_bd_perim/src_bd_perim);
+
+            curr_npos[v] = curr_bd_vert + transpose(curr_bd_frame)*source_bd_frame*disp_vec; //length(curr_bd_vert - centre(m,ext.origin_face))*
+
+            
+            if( !touched[v]) {
+                npos[v] = curr_npos[v];
+                touched[v] = 1;
+            }
+            else {
+                npos[v] += curr_npos[v];
+            }
+
+            weights[v] += 1.0;// += weight;
+            i++;
+        }
+   }
+
+    for (auto it : new_vertices) {
+        auto v = it.first;
+        if(weights[v] > eps) {
+            npos[v] /= weights[v];
+        }
+    }
+
+    m.positions_attribute_vector() = npos;
+}
+
+
+std::pair<HMesh::FaceSet, HMesh::VertexID> find_split_yellow_faces(HMesh::Manifold& m, 
+                                                                    HMesh::FaceSet base_patch_faces, 
+                                                                    std::map<HMesh::VertexID, CGLA::Vec2d>& vertex_uv_map, 
+                                                                    std::vector<std::tuple<CGLA::Vec2d, HMesh::VertexID, bool, HMesh::HalfEdgeID>> curve, 
+                                                                    CGLA::Vec2d bd_v_coor) {
+
+    // -----------------------------
+    // The yellow faces that will be extruded
+    // -----------------------------
+    HMesh::FaceSet yellow_faces;
+
+    // -------------------------
+    // Find faces enclosed by the curve
+    // Just use midpoint of each face
+    // -------------------------
+    map<int, FaceID> uv_face_map;
+    vector<Vec2d> face_uvs;
+    MatrixXd f_uvs;
+    f_uvs.resize(base_patch_faces.size(), 2);
+
+    int i = 0;
+    for (auto f : base_patch_faces) {
+
+        CGLA::Vec2d uv_centre = Vec2d(0.0);
+        double v_counter = 0.0;
+        circulate_face_ccw(m, f, [&] (VertexID v) {
+            Vec2d uv = vertex_uv_map.find(v)->second;
+            uv_centre += uv;
+            v_counter += 1.0;
+        });
+
+        uv_centre /= v_counter;
+
+        face_uvs.push_back(uv_centre);
+        f_uvs(i , 0) = uv_centre[0];
+        f_uvs(i , 1) = uv_centre[1];
+
+        uv_face_map.insert(std::make_pair(i, f));
+        i++;
+    }
+
+    MatrixXi loop_F;
+
+    MatrixXd w;
+
+    double eps = 1e-6;
+
+    int N = curve.size();
+    loop_F.resize(N, 2);
+
+    for(int i = 0; i < N; i++) {
+      loop_F(i, 0) = i;
+      loop_F(i, 1) = (i+1)%N;
+    }
+
+    // -------------------------
+    // Compute the uv-coordinates of the cycle
+    // -------------------------
+    Eigen::MatrixXd cycle_uvs;
+    cycle_uvs.resize(N, 2);
+    for(int i = 0; i < N; i++) {
+      auto p = std::get<0>(curve[i]);
+      cycle_uvs(i, 0) = p[0];
+      cycle_uvs(i, 1) = p[1];
+    }
+    // -------------------------
+    // Compute the winding number for each face
+    // -------------------------
+    igl::winding_number(cycle_uvs, loop_F, f_uvs, w);
+
+    for(int i = 0; i < w.rows(); i++) {
+      if(abs(w(i)) > eps) {
+          yellow_faces.insert(uv_face_map.find(i)->second);
+      }
+    }
+
+    // -------------------------
+    // Find the vertex which has the highest curvature
+    // -------------------------
+    HMesh::VertexID bd_v = HMesh::InvalidVertexID;
+
+    return {yellow_faces, bd_v};
+}
+
+
+std::vector<std::tuple<int, HMesh::FaceSet, CGLA::Vec2d, std::vector<HMesh::VertexID>>> find_curve_enclosed_faces(HMesh::Manifold &m, 
+                                                                                                                HMesh::FaceSet base_patch_faces, 
+                                                                                                                std::map<HMesh::VertexID, CGLA::Vec2d>& v_uv_map, 
+                                                                                                                std::vector<std::tuple<int, std::vector<std::tuple<CGLA::Vec2d, HMesh::VertexID, bool, HMesh::HalfEdgeID>> , CGLA::Vec2d, std::vector<HMesh::VertexID> >> altered_curves) {
+
+    std::vector<std::tuple<int, HMesh::FaceSet, CGLA::Vec2d, std::vector<HMesh::VertexID>>> curve_enclosed_faces;
+
+    HMesh::FaceSet selected_faces;
+    for (int ii = 0; ii < altered_curves.size(); ii++) {
+
+        auto curve_id = std::get<0>(altered_curves[ii]);
+        auto altered_curve = std::get<1>(altered_curves[ii]); //.second;
+        auto bd_v_coor = std::get<2>(altered_curves[ii]);
+        auto yellow_vertices = std::get<3>(altered_curves[ii]);
+
+        auto [yellow_faces, bd_v] = find_split_yellow_faces(m, base_patch_faces, v_uv_map, altered_curve, CGLA::Vec2d(2.0, 0.0));
+        
+
+        selected_faces.insert(yellow_faces.begin(), yellow_faces.end());
+
+        curve_enclosed_faces.push_back(std::tuple(curve_id, yellow_faces, bd_v_coor, yellow_vertices));
+    }
+
+    return curve_enclosed_faces;
+}
+
+
+/* ----------------------------------------------------------------------- *
+ * Insert the points from the curve which are inside the interior of the base-patch into the quad mesh
+ * ----------------------------------------------------------------------- */
+std::vector<std::tuple<int, HMesh::FaceSet, CGLA::Vec2d, std::vector<HMesh::VertexID>>> insert_curve_points_into_qm(HMesh::Manifold &m, 
+                                                                                                                    HMesh::FaceSet& base_patch_faces, 
+                                                                                                                    std::map<HMesh::VertexID, CGLA::Vec2d>& v_uv_map,
+                                                                                                                    std::vector<std::tuple<int, std::vector<std::tuple<CGLA::Vec2d, HMesh::VertexID, bool, HMesh::HalfEdgeID>> , CGLA::Vec2d, std::vector<HMesh::VertexID> >> altered_curves, 
+                                                                                                                    std::map<HMesh::VertexID, CGLA::Vec2d> prev_v_uv_map,
+                                                                                                                    std::map<HMesh::VertexID, std::tuple<CGLA::Vec2d, HMesh::VertexID, HMesh::VertexID, double>>& new_vertices, 
+                                                                                                                    std::string filename) {
+
+    //cout << "INSIDE insert_curve_points_into_qm " << endl;
+    //cout.flush();
+    //------------------------------------------------------------------
+    // Collapse edges, if they are small
+    //------------------------------------------------------------------
+
+    std::vector<std::tuple<int, HMesh::FaceSet, CGLA::Vec2d, std::vector<HMesh::VertexID>>> curve_enclosed_faces;
+
+    // qm: Quad mesh (variable m)
+
+
+    // Set the edge threshold
+    double avg_edge_length = 0.0;
+    auto patch_edges = all_edges_wo_duplicates(m, base_patch_faces);
+    for (auto h : patch_edges) {
+        avg_edge_length += length(m,h);
+    }
+    double edge_length_threshold = 0.1 * (avg_edge_length / patch_edges.size());
+
+    HMesh::HalfEdgeSet edges_to_keep = all_edges(m, base_patch_faces);
+
+    // ----------------------------------------------------------------------
+    // nanoflann kd-Tree
+    // ----------------------------------------------------------------------
+    std::vector<CGLA::Vec2d> base_patch_points;
+    std::map<int, HMesh::VertexID> closest_index_to_vertex;
+    int ii = 0;
+    for (auto v : all_verts(m, base_patch_faces)) {
+        base_patch_points.push_back(v_uv_map.find(v)->second);
+        closest_index_to_vertex.insert(std::make_pair(ii, v));
+        ii++;
+    }
+    Matrix2D mat;
+    rebuildMatrix(base_patch_points, mat);
+    nano_KDTree index(2, std::cref(mat), 10);
+    index.index_->buildIndex();
+
+    double eps = 1e-15;
+
+    std::vector<std::vector<HMesh::VertexID>> vertices_to_connect;
+    HMesh::VertexSet added_vertices;
+
+    // Set to store all the newly added edges
+    HMesh::HalfEdgeSet added_edges;
+
+    std::map<HMesh::VertexID, bool> is_vertex_on_edge;
+ 
+    // ----------------------------------------------------------------------
+    // IMPORTANT: FIRST WE NEED TO CHECK ALL CURVES
+    // ----------------------------------------------------------------------
+    int counter = 0;
+    for (auto it : altered_curves) {
+
+        auto extrusion_id = std::get<0>(it); // .first;
+        auto curve_points = std::get<1>(it); //.second;
+
+        /*
+        cout << "--------------------------" << endl;
+        cout << "This curve consists for face insertion of the following points" << endl;
+        for (auto point : curve_points) {
+            cout << std::get<0>(point) << endl;
+        }
+        cout << "--------------------------" << endl;
+        */
+
+        // ----------------------------------------------------------------------
+        // Start by inserting points into faces, because we now that all faces are still triangle faces
+        // ----------------------------------------------------------------------
+        for (auto it2 : curve_points) {
+            auto p = std::get<0>(it2); // The 2D curve point
+            auto p_vertex_id = std::get<1>(it2);
+            auto is_p_on_edge = std::get<2>(it2);
+
+            //cout << "The point p: " << p << " is in a triangle face" << endl;
+            //cout << "is_p_on_edge: " << is_p_on_edge << endl;
+            //cout << "p_vertex_id: " << p_vertex_id << endl;
+            
+            // The point is not on the halfedge and it is not snapped to an interior vertex, so it must be in a face
+            if (!is_p_on_edge) {
+                //cout << "The point p: " << p << " is to be inserted" << endl;
+
+                // Check that the point does not already exist in the mesh
+                // Like if it is super close to a vertex in the patch
+                double query_pt[2] = {p[0], p[1]};
+                Eigen::Index out_index = 0;
+                double out_dist_sq = 0.0;
+                index.query(query_pt, 1, &out_index, &out_dist_sq);
+
+                //cout << "out_dist_sq: " << out_dist_sq << endl;
+
+                // Check that the point has not already been inserted, and that it is supposed to be inserted
+                if (p_vertex_id == HMesh::InvalidVertexID && out_dist_sq > eps) {
+
+                    //cout << "It passed the dist criteria " << endl;
+
+                    auto [f_to_split, v1, v2, v3, alpha, beta, gamma] = locate_point_in_face(m, base_patch_faces, v_uv_map, p);
+                
+                    CGLA::Vec3d p_3D;
+                    HMesh::VertexID new_v;
+
+                    //cout << "f_to_split: " << f_to_split << endl;
+
+                    if (f_to_split != HMesh::InvalidFaceID && base_patch_faces.find(f_to_split) != base_patch_faces.end()) {
+
+                        //assert(f_to_split != HMesh::InvalidFaceID && base_patch_faces.find(f_to_split) != base_patch_faces.end());
+
+                        p_3D = alpha * m.pos(v1) + beta * m.pos(v2) + gamma * m.pos(v3);
+                        
+                        // If we need to split a face
+                        if (alpha > eps && beta > eps && gamma > eps) {
+                            new_v = m.split_face_by_vertex(f_to_split); 
+
+                            // Delete the splitted face from base_patch_fances and Insert the surrounding faces of the newly inserted vertex into the set of base_patch_faces
+                            base_patch_faces.erase(f_to_split);
+                            //cout << "Erasing face: " << f_to_split << endl;
+                            circulate_vertex_ccw(m, new_v, [&] (HMesh::FaceID fn) {
+                                if (fn != HMesh::InvalidFaceID) {
+                                    base_patch_faces.insert(fn);
+                                    //cout << "Adding face: " << fn << " to the base patch faces after splitting a face." << endl;
+                                }
+                            });
+                            circulate_vertex_ccw(m, new_v, [&] (HMesh::HalfEdgeID h) {
+                                added_edges.insert(h);
+                                added_edges.insert(m.walker(h).opp().halfedge());
+                            });
+
+
+                        }
+
+                        added_vertices.insert(new_v);
+                        auto new_v_uv = alpha * prev_v_uv_map.find(v1)->second + beta * prev_v_uv_map.find(v2)->second + gamma * prev_v_uv_map.find(v3)->second;
+                        new_vertices.insert({new_v, std::make_tuple(new_v_uv, HMesh::InvalidVertexID, HMesh::InvalidVertexID, -1.0)});
+                        prev_v_uv_map.insert({new_v, new_v_uv});
+
+                        v_uv_map.insert({new_v, p});
+                        auto pos_new_v = v_uv_map.find(new_v)->second;
+
+                        base_patch_points.push_back(p);
+                        closest_index_to_vertex.insert(std::make_pair(base_patch_points.size() - 1, new_v));
+                        rebuildMatrix(base_patch_points, mat);
+                        index.index_->buildIndex();
+
+                        // Notice that this vertex is in a face
+                        is_vertex_on_edge.insert({new_v, false});
+
+                        //Change the position of the inserted vertex to its 3D position
+                        m.pos(new_v) = p_3D;
+                        //cout << "Inserted this vertex " << new_v << " with uv_coordinates: " << v_uv_map.find(new_v)->second << " and 3D pos: " << p_3D << " into a face. It's previous uv-coordinates are: " << new_v_uv << " and it is between: " << prev_v_uv_map.find(v1)->second << ", " << prev_v_uv_map.find(v2)->second << ", " << prev_v_uv_map.find(v3)->second << endl;
+
+                    }
+
+                }
+
+            }
+            else {
+                //cout << "Point " << p << " is on edge or at a vertex" << endl;
+            }
+
+
+        }
+    }
+
+   
+    for (auto it : altered_curves) {
+
+        auto extrusion_id = std::get<0>(it); // .first;
+        auto curve_points = std::get<1>(it); //.second;
+
+        /*
+        cout << "--------------------------" << endl;
+        cout << "This curve consists for edge insertion of the following points" << endl;
+        for (auto point : curve_points) {
+            cout << std::get<0>(point) << endl;
+        }
+        cout << "--------------------------" << endl;
+        */
+
+        // ----------------------------------------------------------------------
+        // Afterwards insert points by splitting the edges which we know that we have to split
+        // ----------------------------------------------------------------------
+        for (auto it2 : curve_points) {
+            auto p = std::get<0>(it2); // The 2D curve point
+            auto is_p_on_edge = std::get<2>(it2); 
+
+            // The point is on the halfedge
+            if (is_p_on_edge) {
+                //cout << "The point p: " << p << " is on an edge" << endl;
+
+                // Check that the point does not already exist in the mesh
+                // Like if it is super close to a vertex in the patch
+                double query_pt[2] = {p[0], p[1]};
+                Eigen::Index out_index = 0;
+                double out_dist_sq = 0.0;
+                index.query(query_pt, 1, &out_index, &out_dist_sq);
+
+
+                // Check that the point does not already exists 
+                if (out_dist_sq > eps) {
+
+                    CGLA::Vec3d p_3D;
+                    HMesh::VertexID new_v;
+
+                    auto [edge_2_be_split, s] = locate_point_on_edge(m, v_uv_map, p); // Maybe we don't need to search for the edge, because we know it is h
+                    //auto [edge_2_be_split, s] = locate_point_on_specific_edge(m, selected_edge_2_be_split, v_uv_map, p);
+
+                    auto vA = m.walker(edge_2_be_split).opp().vertex();
+                    auto vB = m.walker(edge_2_be_split).vertex();
+
+                    p_3D = m.pos(vA) + s * (m.pos(vB) - m.pos(vA));
+
+                    auto vn1 = m.walker(edge_2_be_split).vertex();
+                    auto vn2 = m.walker(edge_2_be_split).opp().vertex();
+                    new_v = m.split_edge(edge_2_be_split);
+
+                    /*
+                    circulate_vertex_ccw(m, new_v, [&] (HMesh::HalfEdgeID h) {
+                        if (!(m.walker(h).vertex() == vn1 || m.walker(h).vertex() == vn2)) {
+                            added_edges.insert(h);
+                            added_edges.insert(m.walker(h).opp().halfedge());
+                        }
+                    });
+                    */
+
+                    added_vertices.insert(new_v);
+                    auto new_v_uv = prev_v_uv_map.find(vA)->second + s * (prev_v_uv_map.find(vB)->second - prev_v_uv_map.find(vA)->second);
+                    new_vertices.insert({new_v, std::make_tuple(new_v_uv, vA, vB, s)});
+                    prev_v_uv_map.insert({new_v, new_v_uv});
+
+                    v_uv_map.insert({new_v, p});
+                    auto pos_new_v = v_uv_map.find(new_v)->second;
+                    
+                    base_patch_points.push_back(p);
+                    closest_index_to_vertex.insert(std::make_pair(base_patch_points.size() - 1, new_v));
+                    rebuildMatrix(base_patch_points, mat);
+                    index.index_->buildIndex();
+
+                    // Notice that this vertex is on an edge
+                    is_vertex_on_edge.insert({new_v, true});
+
+                    //Change the position of the inserted vertex to its 3D position
+                    m.pos(new_v) = p_3D;
+                    //cout << "Inserted vertex " << new_v << " with uv_coordinates: " << v_uv_map.find(new_v)->second << " and 3D pos: " << p_3D << " onto an edge. It's previous uv-coordinates are: " << new_v_uv << " and it is between prev_v_uv_map.find(vA)->second: " << prev_v_uv_map.find(vA)->second << " and prev_v_uv_map.find(vB)->second: " << prev_v_uv_map.find(vB)->second  << endl;
+                }
+            }
+        }
+    }
+   
+    for (auto it : altered_curves) {
+
+        auto extrusion_id = std::get<0>(it); // .first;
+        auto curve_points = std::get<1>(it); //.second;
+
+        /*
+        cout << "--------------------------" << endl;
+        cout << "This curve consists for after check of the following points" << endl;
+        for (auto point : curve_points) {
+            cout << std::get<0>(point) << endl;
+        }
+        cout << "--------------------------" << endl;
+        */
+
+        std::vector<HMesh::VertexID> curve_vertices;
+
+        // ----------------------------------------------------------------------
+        // Afterwards insert the other points 
+        // ----------------------------------------------------------------------
+        for (auto it2 : curve_points) {
+
+            CGLA::Vec2d p = std::get<0>(it2); 
+            auto p_vertex_id = std::get<1>(it2);
+
+            if (p_vertex_id != HMesh::InvalidVertexID) {
+                curve_vertices.push_back(p_vertex_id);
+            }
+            else {
+                double query_pt[2] = {p[0], p[1]};
+                Eigen::Index out_index = 0;
+                double out_dist_sq = 0.0;
+                index.query(query_pt, 1, &out_index, &out_dist_sq);
+
+                if (out_dist_sq < eps) {
+                    //cout << "Point p: " << p << " and nanoflann dist is: " << out_dist_sq << endl;;
+                    HMesh::VertexID closest_vertex = closest_index_to_vertex.find(out_index)->second;
+                    added_vertices.insert(closest_vertex);
+                    curve_vertices.push_back(closest_vertex);
+                    //cout << "Need to connect vertex: " << closest_vertex << " with uv_coordinates: " << v_uv_map.find(closest_vertex)->second << " does it exists: " << m.in_use(closest_vertex) << endl;
+                }
+            }
+        }
+        vertices_to_connect.push_back(curve_vertices);
+    }
+
+
+    //------------------------------------------------------------------
+    // Connect inserted points with edges - If two inserted points are not connected by an edge, connect them by an edge. 
+    // If this is not possible due to exisiting edges in the mesh - remove those existing edges
+    // However, we cannot go through them one by one, as we first need to connect every point that is on an edge to a neighbour point in a face. Otherwise, we encounter problems, 
+    // because in the effort of connecting two edge points incident on the same face, we risk removing every new edge in that face, and that can leave an inserted point in that face dangling.
+    //------------------------------------------------------------------
+    for (auto curve : vertices_to_connect) {
+
+        for (int ii = 0; ii < curve.size(); ii++) {
+            auto v1 = curve[ii];
+            auto v2 = curve[(ii+1)%curve.size()];
+
+            // Check that the vertices are not already connected by an edge, that they are still in use and that one of them is on an edge, and the other one in a face
+            if (!are_vertices_connected(m, v1, v2) && m.in_use(v1) && m.in_use(v2) && is_vertex_on_edge.find(v1)->second != is_vertex_on_edge.find(v2)->second && v1 != v2) {
+                
+                /*
+                cout << "Trying to connect v1: " << v1 << " with uv-coordinates: " << v_uv_map.find(v1)->second << " and v2: " << v2 << " with uv-coordinates: " << v_uv_map.find(v2)->second  << endl;
+                cout << "One vertex is on an edge and the other one is in a face, so we can connect them without removing any existing edge." << endl;
+                cout.flush();
+                */
+
+                auto shared_face = find_shared_face(m, v1, v2);
+                if (shared_face != HMesh::InvalidFaceID && base_patch_faces.find(shared_face) != base_patch_faces.end()) {
+                    auto new_face = m.split_face_by_edge(shared_face, v1, v2);
+                    base_patch_faces.insert(new_face);
+                    //cout << "Adding face from splitting it: " << new_face << endl;
+                }
+                else {
+                    //cout << "Could not connect: " << v1 << " and " << v2 << " in face: " << shared_face << endl;
+                } 
+                
+
+
+            }
+        }
+
+    }
+    
+    //------------------------------------------------------------------
+    // Connect inserted points with edges - If two inserted points are not connected by an edge, connect them by an edge. 
+    // If this is not possible due to exisiting edges in the mesh - remove those existing edges
+    //------------------------------------------------------------------
+    HMesh::HalfEdgeSet curve_edges;
+    for (auto curve : vertices_to_connect) {
+
+        for (int ii = 0; ii < curve.size(); ii++) {
+
+            auto v1 = curve[ii];
+            auto v2 = curve[(ii+1)%curve.size()];
+
+            /*
+            cout << "Trying to connect v1: " << v1 << " with uv-coordinates: " << v_uv_map.find(v1)->second << " and v2: " << v2 << " with uv-coordinates: " << v_uv_map.find(v2)->second  << endl;
+            cout << "Are vertices connected: " << are_vertices_connected(m, v1, v2) << endl;
+            cout << "Are they in use: " << m.in_use(v1) << ", " << m.in_use(v2) << endl;
+            cout.flush();
+            */
+            
+            HMesh::FaceID shared_face;
+            if (!are_vertices_connected(m, v1, v2) && m.in_use(v1) && m.in_use(v2) && v1 != v2) {
+
+                shared_face = find_shared_face(m, v1, v2);
+
+                if (shared_face == HMesh::InvalidFaceID) {
+
+                    HMesh::FaceSet fn_set;
+                    circulate_vertex_ccw(m, v1, [&] (HMesh::FaceID fn) {
+                        if (fn != HMesh::InvalidFaceID) {
+                            fn_set.insert(fn);
+                        }
+                    });
+                    auto edges = all_edges(m, fn_set);
+                    std::queue<HMesh::HalfEdgeID> qh;
+                    for (auto h : edges) {
+                        if (do_edges_intersect(m, h, v_uv_map, v1, v2)) {
+                            qh.push(h);
+                        }
+                    }
+                    // Keep removing edges, until we reach the end vertex
+                    while (!qh.empty()) {
+                        auto h = qh.front();
+                        qh.pop();
+
+                        //cout << "Erasing edge h: " << h << endl;
+                        // Find the incident faces 
+                        if (!m.in_use(h) || boundary(m,h)) {
+                            h = m.walker(h).opp().halfedge();
+                        }
+                        base_patch_faces.erase(m.walker(h).face());
+                        //cout << "Removing face in the process: " << m.walker(h).face() << endl;
+                        base_patch_faces.erase(m.walker(h).opp().face());
+                        //cout << "Removing face in the process: " << m.walker(h).opp().face() << endl;
+
+                        auto new_face = remove_edge_add_face(m, h);
+                        base_patch_faces.insert(new_face);
+                        //cout << "Adding face in the process: " << new_face << endl;
+
+                        circulate_face_ccw(m, new_face, [&] (HMesh::HalfEdgeID hn) {
+                            if (do_edges_intersect(m, hn, v_uv_map, v1, v2)) {
+                                qh.push(hn);
+                            }
+                        });
+                    }
+                    shared_face = find_shared_face(m, v1, v2);
+                }
+
+                //cout << "The shared face is: " << shared_face << " and is it part of base_patch_faces: " << (base_patch_faces.find(shared_face) != base_patch_faces.end()) << endl; 
+                if (shared_face != HMesh::InvalidFaceID && base_patch_faces.find(shared_face) != base_patch_faces.end()) {
+                    auto new_face = m.split_face_by_edge(shared_face, v1, v2);
+                    base_patch_faces.insert(new_face);
+                    //cout << "Adding face from splitting it: " << new_face << endl;
+                }
+                else {
+                    //cout << "Could not connect: " << v1 << " and " << v2 << " in face: " << shared_face << endl;
+                }
+                
+                // Find the edge that connects them
+                auto h = find_connecting_edge(m, v1, v2);
+                auto ho = m.walker(h).opp().halfedge();
+                curve_edges.insert(h);
+                curve_edges.insert(ho);
+            }
+            else {
+                //cout << "Vertices: " << v1 << " and " << v2 << " are already connected or one of them is not in use anymore." << endl;
+                //cout << "Is v1 in use: " << m.in_use(v1) << " and is v2 in use: " << m.in_use(v2) << endl;
+            }
+        }
+    }
+
+    //cout << "About to find the faces enclosed by curves" << endl;
+    //cout.flush();
+    //------------------------------------------------------------------
+    // Find the faces enclosed by the curves
+    //------------------------------------------------------------------
+    std::map<HMesh::FaceID, int> face_curve_id_map;
+
+    curve_enclosed_faces = find_curve_enclosed_faces(m, base_patch_faces, v_uv_map, altered_curves);
+    //curve_enclosed_faces = find_curve_overlaps(m, base_patch_faces, v_uv_map, altered_curves);
+
+    for (int ii = 0; ii < curve_enclosed_faces.size(); ii++) {
+        auto curve_id = std::get<0>(curve_enclosed_faces[ii]);
+        auto curve_faces = std::get<1>(curve_enclosed_faces[ii]); //.second;
+
+        for (auto f : curve_faces) {
+            face_curve_id_map.insert(std::make_pair(f, curve_id));
+        }
+        
+    }
+
+    std::map<HMesh::FaceID, HMesh::FaceID> remove_added_faces;
+    
+    //------------------------------------------------------------------
+    // Update faces in curve_enclosed_faces - and detect if some faces have already been used by other extrusions
+    //------------------------------------------------------------------
+    curve_enclosed_faces = find_curve_enclosed_faces(m, base_patch_faces, v_uv_map, altered_curves);
+
+    HMesh::FaceSet already_occupied_faces;
+
+    for (int ii = 0; ii < curve_enclosed_faces.size(); ii++) {
+        auto curve_id = std::get<0>(curve_enclosed_faces[ii]);
+        auto curve_faces = std::get<1>(curve_enclosed_faces[ii]); //.second;
+        auto bd_v_coor = std::get<2>(curve_enclosed_faces[ii]);
+        
+        HMesh::FaceSet remaining_faces;
+        for (auto yf : curve_faces) { // yf = yellow face
+            if (already_occupied_faces.find(yf) == already_occupied_faces.end()) {
+                remaining_faces.insert(yf);
+                already_occupied_faces.insert(yf);
+            }
+        }
+        std::get<1>(curve_enclosed_faces[ii]) = remaining_faces;
+    }
+
+    return curve_enclosed_faces;
+}
+
+
+
+std::vector<std::tuple<CGLA::Vec2d, HMesh::VertexID>> contract_curve(HMesh::Manifold m, HMesh::FaceSet base_patch, std::map<HMesh::VertexID, CGLA::Vec2d>& v_uv_map, std::vector<CGLA::Vec2d> curve, double radius, Geometry::KDTree<CGLA::Vec2d, HMesh::VertexID> bd_verts_tree) {
+
+    auto bd_edges = boundary_hes(m, base_patch);
+
+    std::vector<std::tuple<CGLA::Vec2d, HMesh::VertexID>> final_curve;
+    std::vector<std::tuple<CGLA::Vec2d, HMesh::VertexID>> altered_curve;
+
+    int N = curve.size();
+    for (int ii = 0; ii < curve.size(); ii++) {
+        altered_curve.push_back( {curve[ii], HMesh::InvalidVertexID} );
+    }
+
+    for (int ii = 0; ii < curve.size(); ii++) {
+        CGLA::Vec2d a(curve[ii][0], curve[ii][1]);
+
+        CGLA::Vec2d closest_point;
+        HMesh::VertexID closest_vertex;
+        double dist = std::numeric_limits<double>::infinity();
+        bd_verts_tree.closest_point(a, dist, closest_point, closest_vertex);
+
+        //cout << "Point a: " << a << " which is also: altered_curve[ii]: " << altered_curve[ii] << " is closest to: " << closest_vertex << " with uv-coordinates: " << closest_point << endl;
+
+        std::vector<HMesh::HalfEdgeID> vertex_edges;
+        circulate_vertex_ccw(m, closest_vertex, [&](HalfEdgeID h) {
+            if (bd_edges.find(h) != bd_edges.end() || bd_edges.find(m.walker(h).opp().halfedge()) != bd_edges.end()) {
+                vertex_edges.push_back(h);
+            }
+        });
+
+
+        if (dist <= radius) {
+            //altered_curve[ii] = closest_point;
+            std::get<0>(altered_curve[ii]) = closest_point;
+            std::get<1>(altered_curve[ii]) = closest_vertex;
+        }
+        // Ensure that the curve point does not lie on the wrong side of the boundary edge
+        //else if (dot(vec1, vec2) < 0.0) {
+        //    altered_curve[ii] = closest_point;
+        //}
+        else {
+            // Ensure that the curve point is not within a distance of radius to the edges of the vertex
+            for (auto edge : vertex_edges) {
+                auto AP = a - closest_point;
+                auto AB = v_uv_map.find(m.walker(edge).vertex())->second - closest_point;
+                double t = dot(AB, AP)/powf(length(AB), 2.0);
+                t = max(0.0, min(1.0, t));
+                auto Q = closest_point + t * AB;
+                double dist = length(a - Q);
+                if (dist < radius) {
+                    //altered_curve[ii] = closest_point;
+                    std::get<0>(altered_curve[ii]) = closest_point;
+                    std::get<1>(altered_curve[ii]) = closest_vertex;
+                }
+                else {
+                    auto vec1 = a - Q;
+                    vec1.normalize();
+                    auto vec2 = CGLA::Vec2d(0.0, 0.0) - Q;
+                    vec2.normalize();
+                    if (dot(vec1, vec2) < 0.0) {
+                        //altered_curve[ii] = closest_point;
+                        std::get<0>(altered_curve[ii]) = closest_point;
+                        std::get<1>(altered_curve[ii]) = closest_vertex;
+                    }
+                }   
+            }
+        }
+        //cout << "altered_curve[ii] is therefore: " << altered_curve[ii] << endl;
+
+    }
+
+    // Remove duplicates
+    for (int ii = 0; ii < altered_curve.size(); ii++) {
+        // If it is not a boundary vertex we need it. If it is a boundary vertex, then only include it, if it is not the same as the previous one.
+        if ( std::get<1>(altered_curve[(ii+1)%N]) == HMesh::InvalidVertexID || std::get<1>(altered_curve[ii]) != std::get<1>(altered_curve[(ii+1)%N]) ) {
+            final_curve.push_back(altered_curve[(ii+1)%N]);
+        }
+    }
+
+    return final_curve;
 }
 
 

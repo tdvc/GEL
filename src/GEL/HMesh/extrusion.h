@@ -213,5 +213,7 @@ public:
 };
 
 
+// Function definitions
+Extrusion load_extrusion(std::string file_name);
 
 #endif

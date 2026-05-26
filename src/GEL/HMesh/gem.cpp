@@ -6,9 +6,12 @@
  * ----------------------------------------------------------------------- */
 
 #include "gem.h"
-#include "face_loop.h"
+#include <GEL/HMesh/face_loop.h>
+#include <GEL/HMesh/Manifold.h>
 #include <Eigen/Dense>
 #include <Eigen/Sparse>
+#include <igl/segment_segment_intersect.h>
+#include <GEL/HMesh/Delaunay_triangulate.h>
 
 using namespace CGLA;
 using namespace HMesh;
@@ -48,6 +51,20 @@ HMesh::HalfEdgeSet all_edges(const HMesh::Manifold& m, const HMesh::FaceSet& fs)
     for(auto f: fs)
         circulate_face_ccw(m, f, [&](HMesh::HalfEdgeID h) {
             hs.insert(h);
+        });
+    return hs;
+}
+
+ /* ----------------------------------------------------------------------- *
+  * Finds all the edges of the set of faces (fs), but does not return both halfedges
+  * ----------------------------------------------------------------------- */
+HMesh::HalfEdgeSet all_edges_wo_duplicates(const HMesh::Manifold& m, const HMesh::FaceSet& fs) {
+    HMesh::HalfEdgeSet hs;
+    for(auto f: fs)
+        circulate_face_ccw(m, f, [&](HalfEdgeID h) {
+            if (hs.find(m.walker(h).opp().halfedge()) == hs.end()) {
+                hs.insert(h);
+            }
         });
     return hs;
 }
@@ -660,5 +677,582 @@ HMesh::FaceID find_patch_center(HMesh::Manifold &m, HMesh::FaceSet fs) {
     }
 
     return patch_center;
+}
+
+/* ----------------------------------------------------------------------- *
+ * Function which finds the edge, which connects the two vertices v1 and v2, if such one exists
+ * ----------------------------------------------------------------------- */
+HMesh::HalfEdgeID find_connecting_edge(HMesh::Manifold m, HMesh::VertexID v1, HMesh::VertexID v2) {
+
+    HMesh::HalfEdgeID connecting_edge;
+    circulate_vertex_ccw(m, v1, [&](HalfEdgeID h) {
+        if (m.walker(h).vertex() == v2) {
+            connecting_edge = h;
+        }
+    });
+    if (connecting_edge == HMesh::InvalidHalfEdgeID) {
+        std::cout << "vertices v1: " << v1 << " and v2: " << v2 << " are not connected" << std::endl;
+        assert(false);
+    }
+    return connecting_edge;
+}
+
+/* ----------------------------------------------------------------------- *
+ * Function which finds the face, which is shared by the two vertices v1 and v2
+ * ----------------------------------------------------------------------- */
+HMesh::FaceID find_shared_face(HMesh::Manifold &m, HMesh::VertexID v1, HMesh::VertexID v2) {
+
+    if (!m.in_use(v1) || !m.in_use(v2)) {
+        return HMesh::InvalidFaceID;
+    }
+
+    HMesh::FaceID shared_face = HMesh::InvalidFaceID;
+
+    HMesh::FaceSet fn;
+    circulate_vertex_ccw(m, v1, [&] (HMesh::FaceID f) {
+        if (m.in_use(f)) {
+            fn.insert(f);
+        }
+    });
+    circulate_vertex_ccw(m, v2, [&] (HMesh::FaceID f) {
+        if (fn.find(f) != fn.end() && m.in_use(f)) {
+            shared_face = f;
+        }
+    });
+    return shared_face;
+}
+
+/* ----------------------------------------------------------------------- *
+ * Find the area of a 2D polygon, where the vertices are given by a Nx2 matrix
+ * ----------------------------------------------------------------------- */
+double area_of_polygon(Eigen::MatrixXd curr_loop_V) {
+    if (curr_loop_V.rows() < 4) {
+        return 0.0;
+    }
+
+    double area = 0.0;
+    int n = curr_loop_V.rows();
+    for (int i = 0; i < n; i++) {
+        int j = (i + 1) % n;
+        area += curr_loop_V(i,0) * curr_loop_V(j,1);
+        area -= curr_loop_V(j,0) * curr_loop_V(i,1);
+    }
+    area = fabs(area) / 2.0;
+    return area;
+}
+
+std::vector<double> seg_circle_ts(CGLA::Vec2d a, CGLA::Vec2d b) {
+
+    double eps = 1e-5;
+
+    std::vector<double> ts;
+
+    auto d = b - a;
+    auto A = dot(d,d);
+    auto B = 2.0 * dot(a, d);
+    auto Cq = dot(a, a) - 1.0;
+    if (A < eps && A > -eps) {
+        return ts;
+    }
+    double disc = B * B - 4.0 * A * Cq;
+    if (disc < eps) {
+        return ts;
+    }
+    auto sqrt_disc = sqrt(std::max(0.0, disc));
+    double t1 = (-B - sqrt_disc) / (2.0 * A);
+    double t2 = (-B + sqrt_disc) / (2.0 * A);
+    if (eps < t1 && t1 < 1.0 - eps) {
+        ts.push_back(t1);
+    }
+    if (eps < t2 && t2 < 1.0 - eps) {
+        ts.push_back(t2);
+    }
+    std::sort(ts.begin(), ts.end());
+    return ts;
+}
+
+double sector_area(CGLA::Vec2d a, CGLA::Vec2d b) {
+    double eps = 1e-5;
+    CGLA::Vec2d uu, vv = CGLA::Vec2d(0.0, 0.0);
+    if (length(a) > eps) {
+        uu = a;
+        normalize(uu);
+    }
+    if (length(b) > eps) {
+        vv = b;
+        normalize(vv);
+    }
+    double theta = atan2(uu[0]*vv[1] - uu[1]*vv[0], dot(uu, vv));
+    return 0.5 * theta;
+}
+
+/* ----------------------------------------------------------------------- *
+ * The purpose of this function is to find out, whether the curve curr_loop_V is segmenting faces on the face-loop or on the base-patch
+ * ----------------------------------------------------------------------- */
+double area_of_curve_inside_circle(Eigen::MatrixXd curr_loop_V) {
+    if (curr_loop_V.rows() < 4) {
+        return 0.0;
+    }
+
+    std::vector<CGLA::Vec2d> curve;
+    for (int i = 0; i < curr_loop_V.rows(); i++) {
+        curve.push_back(CGLA::Vec2d(curr_loop_V(i,0), curr_loop_V(i,1)));
+    }
+
+    double inside_area = 0.0;
+
+    for (int ii = 0; ii < curve.size(); ii++) {
+        auto a = curve[ii];
+        auto b = curve[(ii+1)%curve.size()];
+        
+        std::vector<double> ts;
+        ts.push_back(0.0);
+        auto intersections = seg_circle_ts(a, b);
+        for (auto t : intersections) {
+            ts.push_back(t);
+        }
+        ts.push_back(1.0);
+        for (int jj = 0; jj < ts.size() - 1; jj++) {
+            auto t0 = ts[jj];
+            auto t1 = ts[jj+1];
+            auto p0 = a + t0 * (b - a);
+            auto p1 = a + t1 * (b - a);
+            auto mid = p0 + 0.5 * (p1 - p0);
+            if (length(mid) <= 1.0 + 1e-12) {
+                inside_area += 0.5 * (p0[0]*p1[1] - p0[1]*p1[0]);
+            }
+            else {
+                inside_area += sector_area(p0, p1);
+            }
+        }
+    }
+
+    return fabs(inside_area);
+}
+
+/* ----------------------------------------------------------------------- *
+ * Check if a 2D-point C is on a line between 2D-point A and 2D-point B
+ * ----------------------------------------------------------------------- */
+bool is_point_on_the_line(CGLA::Vec2d a, CGLA::Vec2d b, CGLA::Vec2d c) {
+    double eps = 1e-5;
+    
+    // Determinant check
+    double determinant = (a[0] - b[0])*(c[1] - b[1]) - (a[1] - b[1])*(c[0] - b[0]);
+    
+    // Bounding box check
+    bool inside_x = (std::min(b[0],c[0]) <= a[0] && std::max(b[0],c[0]) >= a[0]);
+    bool inside_y = (std::min(b[1],c[1]) <= a[1] && std::max(b[1],c[1]) >= a[1]);
+    
+    if (fabs(determinant) < eps && inside_x && inside_y) {
+        return true;
+    }
+    return false;
+}
+
+/* ----------------------------------------------------------------------- *
+ * Does an halfedge h in the patch m intersect a line between the two 2D points A and B.
+ * 2D-coordinates for the vertices of the mesh m are in v_uv_map.
+ * ----------------------------------------------------------------------- */
+std::pair<bool, double> do_edge_intersect_curve_t_value(HMesh::Manifold &m, HMesh::HalfEdgeID h1, CGLA::Vec2d a, CGLA::Vec2d b, std::map<HMesh::VertexID, CGLA::Vec2d>& v_uv_map) {
+    Matrix <double, 1, 3> p;
+    Matrix <double, 1, 3> r;
+    Matrix <double, 1, 3> q;
+    Matrix <double, 1, 3> s;
+
+    double eps = 1e-6;
+
+    double t, u;
+
+    auto p_pos = v_uv_map.find(m.walker(h1).opp().vertex())->second;
+    auto r_pos = v_uv_map.find(m.walker(h1).vertex())->second;
+
+    p << p_pos[0], p_pos[1], 0.0;
+    r << r_pos[0], r_pos[1], 0.0;
+
+    auto q_pos = a;
+    auto s_pos = b;
+
+    q << q_pos[0], q_pos[1], 0.0;
+    s << s_pos[0], s_pos[1], 0.0;
+
+    bool intersection = (igl::segment_segment_intersect(p, r - p, q, s - q, t, u) && t > eps&& t < 1.0-eps);
+
+    //return std::make_pair(intersection, Vec2d(p(0,0) + t * (r(0,0) - p(0,0)) , p(0,1) + t * (r(0,1) - p(0,1))));
+    return std::make_pair(intersection, t);
+}
+
+/* ----------------------------------------------------------------------- *
+ * Check if a 2D-point C is on a line between 2D-point A and 2D-point B
+ * ----------------------------------------------------------------------- */
+bool do_edges_intersect(HMesh::Manifold &m, HMesh::HalfEdgeID h1, std::map<HMesh::VertexID, CGLA::Vec2d>& v_uv_map, HMesh::VertexID v1, HMesh::VertexID v2) {
+
+    return do_edge_intersect_curve_t_value(m, h1, v_uv_map.find(v1)->second, v_uv_map.find(v1)->second, v_uv_map).first;
+}
+
+/* ----------------------------------------------------------------------- *
+ * Checks if two vertices v1 and v2 are connected in the mesh m
+ * ----------------------------------------------------------------------- */
+bool are_vertices_connected(HMesh::Manifold &m, HMesh::VertexID v1, HMesh::VertexID v2) {
+    
+    if (!m.in_use(v1) || !m.in_use(v2) || v1 == HMesh::InvalidVertexID || v2 == HMesh::InvalidVertexID) {
+        return false;
+    }
+    else if (v1 == v2) {
+        return true;
+    }
+
+    bool connected = false;
+    
+    circulate_vertex_ccw(m, v1,[&](VertexID vn){
+        if (vn == v2) {
+            connected = true;
+        }
+    });
+    return connected;
+}
+
+/* ----------------------------------------------------------------------- *
+ * Removes an edge between two faces. This also removes the two incident faces, 
+ * and a new face is then inserted
+ * ----------------------------------------------------------------------- */
+HMesh::FaceID remove_edge_add_face(HMesh::Manifold &m, HMesh::HalfEdgeID h) {
+
+    if (!m.in_use(h) || boundary(m,h)) {
+        h = m.walker(h).opp().halfedge();
+    }
+
+    // Assert that the vertices at the end of the edge h have valency bigger than 1, otherwise we cannot merge the two faces
+    assert(valency(m, m.walker(h).vertex()) > 1 && valency(m, m.walker(h).opp().vertex()) > 1);
+    //assert(m.in_use(h) && m.in_use(m.walker(h).opp().halfedge()));
+    assert(m.in_use(h) && !boundary(m,h));
+
+    std::vector<CGLA::Vec3d> pts;
+    auto h_orig = h;
+    while (m.walker(h).next().halfedge() != h_orig) {
+        pts.push_back(m.pos(m.walker(h).vertex()));
+        h = m.walker(h).next().halfedge();
+    }
+    h_orig = m.walker(h_orig).opp().halfedge();
+    h = h_orig;
+    while (m.walker(h).next().halfedge() != h_orig) {
+        pts.push_back(m.pos(m.walker(h).vertex()));
+        h = m.walker(h).next().halfedge();
+    }
+    m.remove_edge(h_orig);
+    auto new_face = m.add_face(pts);
+    stitch_mesh(m, 1e-5);
+    return new_face;
+}
+
+/* ----------------------------------------------------------------------- *
+ * Computes barycentric coordinates of a 2D point p given three 2D points V0, V1 and V2
+ * ----------------------------------------------------------------------- */
+std::vector<double> compute_barycentric_coordinates(Matrix<double, 1, 2> V0, Matrix<double, 1, 2> V1, Matrix<double, 1, 2> V2, Matrix<double, 1, 2> p) {
+
+    std::vector<double> coordinates;
+
+    double A0 = (V1[0] - p[0]) * (V2[1] - p[1]) - (V1[1] - p[1]) * (V2[0] - p[0]);
+    double A1 = (V2[0] - p[0]) * (V0[1] - p[1]) - (V2[1] - p[1]) * (V0[0] - p[0]);
+    double A2 = (V0[0] - p[0]) * (V1[1] - p[1]) - (V0[1] - p[1]) * (V1[0] - p[0]);
+
+    double total = A0 + A1 + A2;
+
+    coordinates.push_back(A0 / (total));
+    coordinates.push_back(A1 / (total));
+    coordinates.push_back(A2 / (total));
+    return coordinates;
+}
+
+/* ----------------------------------------------------------------------- *
+ * Finds the barycentric coordinates as well as the vertices of the triangle face, which contains the 2D-point "point"
+ * ----------------------------------------------------------------------- */
+std::tuple<FaceID, VertexID, VertexID, VertexID, double, double, double> locate_point_in_face(HMesh::Manifold &m, HMesh::FaceSet base_patch_faces, std::map<HMesh::VertexID, CGLA::Vec2d>& v_uv_map, CGLA::Vec2d point) {
+    
+    HMesh::FaceID inside_face = HMesh::InvalidFaceID;
+    HMesh::VertexID v1, v2, v3;
+    double alpha, beta, gamma;
+
+    double eps = 1e-5;
+
+    for (auto f : base_patch_faces) {
+
+
+        if (face_valency(m, f) != 3) {
+            continue;
+        }
+
+        // Every face is a triangle
+        std::vector<CGLA::Vec2d> uv_points;
+        std::vector<HMesh::VertexID> vertices;
+        circulate_face_ccw(m, f, [&] (VertexID vn) {
+            uv_points.push_back(v_uv_map.find(vn)->second);
+            vertices.push_back(vn);
+
+        });
+        //auto pA = m.pos(m.walker(h).vertex());
+        auto pA = uv_points[0];
+        
+        //auto pB = centre(m,f);
+        auto pB = uv_points[1];
+
+        //auto pC = m.pos(m.walker(h).opp().vertex());
+        auto pC = uv_points[2];
+
+        Matrix<double, 1, 2> p;
+        p << point[0], point[1];
+
+        Matrix<double, 1, 2> Va;
+        Va << pA[0], pA[1];
+
+        Matrix<double, 1, 2> Vb;
+        Vb << pB[0], pB[1];
+
+        Matrix<double, 1, 2> Vc;
+        Vc << pC[0], pC[1];
+
+        bool inside = true;
+        
+        auto coordinates = compute_barycentric_coordinates(Va, Vb, Vc, p);
+        for (auto c : coordinates) {
+            if(c > 1 + eps || c < -eps || std::isnan(c) || std::signbit(c)) {
+                inside = false;
+            }
+        }
+
+        if (inside) {
+            inside_face = f;
+            v1 = vertices[0];
+            v2 = vertices[1];
+            v3 = vertices[2];
+
+            alpha = coordinates[0];
+            beta = coordinates[1];
+            gamma = coordinates[2];
+        }
+
+    }
+    return std::make_tuple(inside_face, v1, v2, v3, alpha, beta, gamma);
+}
+
+/* ----------------------------------------------------------------------- *
+ * Checks whether a 2D point is on an edge, and if so where on the edge it is
+ * ----------------------------------------------------------------------- */
+std::pair<HMesh::HalfEdgeID, double> locate_point_on_edge(HMesh::Manifold&m, std::map<HMesh::VertexID, CGLA::Vec2d>& v_uv_map, CGLA::Vec2d p) {
+
+    HMesh::HalfEdgeID edge;
+    double s = 0.0;
+
+    double eps = 1e-5;
+
+    for (auto h : m.halfedges()) {
+
+        // Make sure that we do not run over any edge that is not possible
+        if (v_uv_map.find(m.walker(h).opp().vertex()) != v_uv_map.end() && v_uv_map.find(m.walker(h).vertex()) != v_uv_map.end()) {
+
+            auto A = v_uv_map.find(m.walker(h).opp().vertex())->second;
+            auto B = v_uv_map.find(m.walker(h).vertex())->second;
+
+            auto AB = B - A;
+            auto AP = p - A;
+
+            double t = dot(AP, AB) / powf(length(AB),2.0);
+
+            t = std::max(0.0, std::min(1.0, t));
+
+            auto Q = A + t * AB;
+
+            double dist = length(Q - p);
+
+            if (dist < eps) {
+                edge = h;
+                s = t;
+            }
+        }
+    }
+    return {edge, s};
+} 
+
+
+
+void delaunay_triangulate_each_single_face2(HMesh::Manifold &m, HMesh::Manifold &m_copy, HMesh::FaceSet& base_patch_faces, HMesh::FaceSet& base_patch_faces_copy, std::map<HMesh::VertexID, CGLA::Vec2d>& v_uv_map, std::map<HMesh::VertexID, CGLA::Vec2d>& v_uv_map_copy, std::vector<std::tuple<int, HMesh::FaceSet, HMesh::VertexID, bool, std::vector<HMesh::VertexID>>> &curve_enclosed_faces, std::map<HMesh::VertexID, std::tuple<CGLA::Vec2d, HMesh::VertexID, HMesh::VertexID, double>>& new_vertices) {
+
+    std::map<int, HMesh::FaceSet> non_base_patch_faces;
+
+    for (auto &it : curve_enclosed_faces) {
+        auto extrusion_id = std::get<0>(it); //.first;
+        auto& yellow_faces = std::get<1>(it); //.second;
+
+        HMesh::FaceSet faces_to_triangulate;
+
+        for (auto f : yellow_faces) {
+            if (base_patch_faces.find(f) != base_patch_faces.end()) {
+                
+                // Check that it is a base-patch face and then that it has more than 3 vertices
+                if (face_valency(m, f) > 3) {
+                    faces_to_triangulate.insert(f);
+                }
+            }
+        }
+
+        // Split the faces
+        for (auto f : faces_to_triangulate) {
+
+            //cout << endl;
+            //cout << "Triangulating face f: " << f << endl;
+
+            int no_vertices = face_valency(m, f);
+
+            // So we actually know that the face is in use
+            if (no_vertices > 3) {
+
+                HMesh::FaceSet newly_created_faces;
+
+                //cout << "no_vertices: " << no_vertices << endl;
+                //cout.flush();
+
+                std::vector<CGLA::Vec3d> mesh_points;
+
+                std::vector<int> edge_list;
+
+                std::map<HMesh::VertexID, int> v_id_map;
+                std::map<int, HMesh::VertexID> id_v_map;
+                int counter = 0; 
+
+                HMesh::VertexSet face_vertices;
+
+                circulate_face_ccw(m, f, [&] (VertexID vn) {
+                    face_vertices.insert(vn);
+                    //cout << "Face vertex: " << vn << " with uv: " << v_uv_map.find(vn)->second << endl;
+                    //cout.flush();
+
+                    v_id_map.insert({vn, counter});
+                    id_v_map.insert({counter, vn});
+
+                    mesh_points.push_back(CGLA::Vec3d(v_uv_map.find(vn)->second[0], v_uv_map.find(vn)->second[1], 0.0));
+
+                    edge_list.push_back(counter);
+                    edge_list.push_back((counter+1)%no_vertices);
+                    
+                    counter += 1;
+                });
+
+                // Do the Delaunay triangulation of this particular face
+                CGLA::Vec3d X_axis = CGLA::Vec3d(1.0, 0.0, 0.0);
+                CGLA::Vec3d Y_axis = CGLA::Vec3d(0.0, 1.0, 0.0);
+
+                auto result = constrained_Delaunay_triangulate(mesh_points, edge_list, X_axis, Y_axis);
+                auto triangle_edges = std::get<1>(result);
+                auto polygon_points = std::get<2>(result);
+
+                // If triangle_edges, which is a map of all vertices and their outgoing edges, has more elements than mesh_points, 
+                // then the constrained_Delaunay_triangulation code has added Steiner points. We don't know how to handle this yet, 
+                // and therefore we just place a vertex in the middle of the face 
+                HMesh::FaceID f_to_split;
+                if (polygon_points.size() > mesh_points.size()) {
+  
+                    CGLA::Vec3d new_v_3d_pos;
+
+                    // Loop over all the new inserted points
+                    HMesh::FaceSet fs_2_split;
+                    fs_2_split.insert(f);
+
+                    for (int ii = mesh_points.size(); ii < polygon_points.size(); ii++) {
+                        auto new_v_uv = polygon_points[ii];
+
+                        //cout << "The new vertex uv coordinates are: " << new_v_uv << endl;
+
+                        HMesh::VertexID new_v;
+
+                        // The first time that we insert a point
+                        if (ii == mesh_points.size()) {
+                            //cout << "Inserting the first Steiner point in the middle of the face..." << f << endl;
+                            f_to_split = f;
+                            //cout << "The face to split is: " << f_to_split << endl;
+                            new_v = m.split_face_by_vertex(f_to_split);
+                        }
+                        else {
+                            // Detect which face to split
+                            // Only look at those faces that have been created, because all Steiner points will of course be inside one of these faces
+                            auto result = locate_point_in_face(m, fs_2_split, v_uv_map, new_v_uv);
+                            f_to_split = std::get<0>(result);
+                            new_v = m.split_face_by_vertex(f_to_split);
+                        }
+
+                        //cout << "Before computing the new vertex position, the face to split is: " << f_to_split << endl;
+                        //cout.flush();
+
+                        m.pos(new_v) = compute_new_v_pos_3d(m_copy, base_patch_faces_copy, v_uv_map_copy, new_v_uv);
+
+                        //cout << "The new vertex 3D coordinates are: " << m.pos(new_v) << endl;
+
+                        new_vertices.insert({new_v, std::make_tuple(new_v_uv, HMesh::InvalidVertexID, HMesh::InvalidVertexID, -1.0)});
+
+                        v_uv_map.insert(std::make_pair(new_v, new_v_uv));
+
+                        // Add new faces
+                        circulate_vertex_ccw(m, new_v, [&] (FaceID fn) {
+                            base_patch_faces.insert(fn);
+                            yellow_faces.insert(fn);
+                            fs_2_split.insert(fn);
+                        });
+
+                        // Delete the old face
+                        base_patch_faces.erase(f_to_split);
+                        yellow_faces.erase(f_to_split);
+                        fs_2_split.erase(f_to_split);
+
+                        //cout << "Inserted new vertex: " << new_v << " with uv: " << new_v_uv << " and 3D position: " << m.pos(new_v) << endl;
+                        //cout.flush();
+                    }     
+                }
+                else {
+                    // No steiner points were added and we just triangualte it.
+
+                    newly_created_faces.insert(f);
+
+                    for (auto v : face_vertices) {
+                        auto v_id = v_id_map.find(v)->second;
+                        if (triangle_edges.find(v_id) != triangle_edges.end()) {
+                            for (auto vn_id : triangle_edges.find(v_id)->second) {
+                                if (id_v_map.find(vn_id) != id_v_map.end()) {
+                                    auto vn = id_v_map.find(vn_id)->second;
+
+                                    //cout << "Are vertices connected: " << v << " and " << vn << "? " << are_vertices_connected(m, v, vn) << endl;
+
+                                    // Check that they are not already connected
+                                    if (!are_vertices_connected(m, v, vn)) {
+                                        //cout << "Connecting vertex: " << v << " and " << vn << endl;
+
+                                        auto shared_face = find_shared_face(m, v, vn);
+                                        if (shared_face != HMesh::InvalidFaceID && m.in_use(shared_face) && newly_created_faces.find(shared_face) != newly_created_faces.end()) {
+                                        //if (shared_face != HMesh::InvalidFaceID && m.in_use(shared_face)) {
+
+                                            auto new_face = m.split_face_by_edge(shared_face, v, vn);
+
+                                            //cout << "Adding new face: " << new_face << " by splitting face: " << shared_face << " between vertices: " << v << " and " << vn << endl;
+                                            //cout.flush();
+
+                                            // Insert the newly created face
+                                            newly_created_faces.insert(new_face);
+
+                                            // Insert into the base patch faces
+                                            base_patch_faces.insert(new_face);
+
+                                            yellow_faces.insert(new_face);
+
+                                        }
+                                    }
+
+                                } 
+                            }
+
+                        }
+                    }
+                }
+            }
+    
+        }
+    }
+
 
 }

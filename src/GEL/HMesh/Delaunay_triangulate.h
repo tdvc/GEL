@@ -14,5 +14,7 @@
 
 namespace HMesh {
     HMesh::Manifold Delaunay_triangulate(const std::vector<CGLA::Vec3d>& pts3d, const CGLA::Vec3d& X_axis = CGLA::Vec3d(1,0,0), const CGLA::Vec3d& Y_axis = CGLA::Vec3d(0,1,0));
+
+    std::tuple<HMesh::Manifold, std::map<int, std::set<int>>, std::vector<CGLA::Vec2d>> constrained_Delaunay_triangulate(const std::vector<CGLA::Vec3d>& pts3d, std::vector<int>& edge_list, const CGLA::Vec3d& X_axis = CGLA::Vec3d(1,0,0), const CGLA::Vec3d& Y_axis = CGLA::Vec3d(0,1,0));
 }
 #endif /* Delaunay_triangulate_hpp */

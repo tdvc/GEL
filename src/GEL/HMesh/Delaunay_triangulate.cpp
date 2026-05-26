@@ -88,5 +88,118 @@ namespace HMesh {
         return m_new;
     }
 
+
+    std::tuple<HMesh::Manifold, std::map<int, std::set<int>>, std::vector<CGLA::Vec2d>> constrained_Delaunay_triangulate(const std::vector<CGLA::Vec3d>& pts3d, std::vector<int>& edge_list, const CGLA::Vec3d& X_axis, const CGLA::Vec3d& Y_axis) {
+        vector<Vec2d> pts2d(pts3d.size());
+        for (int i=0;i<pts3d.size();++i) {
+            pts2d[i] = Vec2d(dot(pts3d[i], X_axis), dot(pts3d[i], Y_axis));
+        }
+        
+        // The code below builds the triangulation
+        triangulateio pts_in, tri_out;
+        pts_in.numberofpoints = pts2d.size();
+        pts_in.pointlist = static_cast<double*>(&(pts2d[0][0]));
+        pts_in.numberofpointattributes = 0;
+        pts_in.pointmarkerlist = 0;
+        pts_in.numberofsegments = edge_list.size();
+        pts_in.segmentlist = edge_list.data();
+        pts_in.segmentmarkerlist = 0;
+        pts_in.numberofholes = 0;
+        pts_in.numberofregions = 0;
+        
+        tri_out.pointlist = 0;
+        tri_out.pointmarkerlist = 0;
+        tri_out.pointattributelist = 0;
+        tri_out.numberofpointattributes = 0;
+        tri_out.segmentlist = 0;
+        tri_out.trianglelist = 0;
+        
+        // Call Triangle with arguments that specify: (z)ero is firt index, (p)slg triangulation.
+        // (c) encloses the convex hull with segments, a truly (D)elaunay mesh, no (B)oundary markers, no (S)teiner points not absolutely needed. Operate (Q)ietly.
+        //string triangulate_cmd_str("zpqcBSQ"); // Original command
+        //string triangulate_cmd_str("pqcDBzS0CQ"); // pqcDBzSCQ
+        string triangulate_cmd_str("pBzOS0Q"); // pqcDBzSCQ // pqBzS0CQ
+        triangulate(triangulate_cmd_str.data(), &pts_in, &tri_out, 0);
+        
+        if(tri_out.numberofpoints > pts_in.numberofpoints){
+            cout << "Steiner points were created, any incident triangles will be removed..." << endl;
+        }
+        
+        // Now, go through all triangles created and add them to the mesh. If a vertex of a triangle
+        // is detected as belonging to the ROI boundary or a forced Steiner point, it is removed.
+        // If a triangle belongs to the exterior of the boundary, we also remove it. This test is tricky,
+        // but we can use the fact that edges are oriented. If all three vertices belong to the boundary,
+        // the outside triangles have two edges with same orientation as the boundary chain orientation
+        // whereas the interior triangles have only one.
+        
+        Manifold m_new;
+        VertexAttributeVector<int> vid_to_index;
+
+        std::map<int, std::set<int>> triangle_edges;
+
+        std::vector<Vec2d> points;
+        for (int ii = 0; ii < tri_out.numberofpoints; ++ii) {
+            double x = tri_out.pointlist[2 * ii + 0];
+            double y = tri_out.pointlist[2 * ii + 1];
+            //cout << "Outputting point: [" << x << "," << y << "]" << endl;
+            points.push_back(Vec2d(x, y));
+        }
+        
+        for(int l=0;l<tri_out.numberoftriangles; ++l) {
+            int i = tri_out.trianglelist[3*l+0];
+            int j = tri_out.trianglelist[3*l+1];
+            int k = tri_out.trianglelist[3*l+2];
+
+            //cout << "Triangle " << l << ": " << i << "," << j << "," << k << endl;
+
+            // Insert the edges into the triangles
+            auto it = triangle_edges.find(i);
+            if (it != triangle_edges.end()) {
+                it->second.insert({j,k});
+            }
+            else {
+                triangle_edges.emplace(i, std::set<int>{j,k});
+            }
+            it = triangle_edges.find(j);
+            if (it != triangle_edges.end()) {
+                it->second.insert({i,k});
+            }
+            else {
+                triangle_edges.emplace(j, std::set<int>{i,k});
+            }
+            it = triangle_edges.find(k);
+            if (it != triangle_edges.end()) {
+                it->second.insert({i,j});
+            }
+            else {
+                triangle_edges.emplace(k, std::set<int>{i,j});
+            }
+            
+            if(!(i<pts2d.size() && j<pts2d.size() && k<pts2d.size())) {
+                cout << "Removing face incident on Steiner " << endl;
+                //continue;
+            }
+            
+            FaceID f = m_new.add_face({pts3d[i], pts3d[j], pts3d[k]});
+            //FaceID f = m_new.add_face({CGLA::Vec3d(xi, yi, 0.0), CGLA::Vec3d(xj, yj, 0.0), CGLA::Vec3d(xk, yk, 0.0)});
+            Walker w = m_new.walker(f);
+            vid_to_index[w.vertex()] = i; w = w.next();
+            vid_to_index[w.vertex()] = j; w = w.next();
+            vid_to_index[w.vertex()] = k;
+        }
+        
+        // Release memory used by triangle.
+        trifree(tri_out.trianglelist);
+        trifree(tri_out.pointlist);
+        trifree(tri_out.pointattributelist);
+        trifree(tri_out.segmentlist);
+        trifree(tri_out.pointmarkerlist);
+        
+        // Stitch the added faces. the mapping to global index is used to sort out connectivity.
+        stitch_mesh(m_new,vid_to_index);
+        
+        return {m_new, triangle_edges, points};
+    }
+
   
 }
