@@ -14,6 +14,32 @@ using namespace CGLA;
 using namespace HMesh;
 using namespace Eigen;
 
+ 
+/* ----------------------------------------------------------------------- *
+ * Function, which just determines, whether a string is actually an integer
+ * ----------------------------------------------------------------------- */
+bool isInteger(const std::string& str) {
+    if (str.empty() || str == " ") {
+        return false; // Empty strings are not integers
+    }
+
+    size_t start = 0;
+
+    // Check for optional '+' or '-' sign
+    if (str[0] == '+' || str[0] == '-') {
+        start = 1;
+    }
+
+    // Traverse the rest of the string
+    for (size_t i = start; i < str.length(); ++i) {
+        if (str[i] < '0' || str[i] > '9') { // Check if character is a digit
+            return false;
+        }
+    }
+
+    return true;
+}
+
  /* ----------------------------------------------------------------------- *
   * Finds all the edges of the set of faces (fs)
   * ----------------------------------------------------------------------- */
@@ -104,7 +130,7 @@ HMesh::HalfEdgeSet boundary_hes(const HMesh::Manifold &m, HMesh::FaceSet& fs) {
  * Purpose of function: To find the boundary vertices of a set of faces (patch_faces)
  * in a counter clock-wise manner starting from the boundary vertex (ref_v)
  * ----------------------------------------------------------------------- */
-std::vector<HMesh::VertexID> find_boundary_vertices(const HMesh::Manifold &m, HMesh::FaceSet patch_faces, HMesh::VertexID ref_v) {
+std::vector<HMesh::VertexID> ccw_ordered_bd_vertices(const HMesh::Manifold &m, HMesh::FaceSet patch_faces, HMesh::VertexID ref_v) {
 
     auto unordered_bd_vertices = boundary_verts(m, patch_faces);
     if (unordered_bd_vertices.find(ref_v) == unordered_bd_vertices.end()) {
@@ -141,7 +167,7 @@ std::vector<HMesh::VertexID> find_boundary_vertices(const HMesh::Manifold &m, HM
  * Purpose of function: To find the boundary edges of a set of faces (patch_faces)
  * in a counter clock-wise manner starting from the boundary edge originating from boundary vertex (ref_v)
  * ----------------------------------------------------------------------- */
-std::vector<HMesh::HalfEdgeID> find_boundary_edges_from_ref_v(const HMesh::Manifold &m, HMesh::FaceSet patch_faces, HMesh::VertexID ref_v) {
+std::vector<HMesh::HalfEdgeID> ccw_ordered_bd_edges(const HMesh::Manifold &m, HMesh::FaceSet patch_faces, HMesh::VertexID ref_v) {
     std::vector<HMesh::HalfEdgeID> bd_edges_in_order;
     
     HMesh::HalfEdgeSet bd_edges = boundary_hes(m, patch_faces);

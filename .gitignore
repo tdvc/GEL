@@ -15,6 +15,7 @@
 
 # obj files not in data.
 /GEL_WIN/*/*/*.obj
+/src/demo/MeshEditGlut/*.obj
 
 
 # .lib

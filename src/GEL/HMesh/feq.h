@@ -23,194 +23,78 @@
 #include <GEL/Geometry/KDTree.h>
 #include <stack>
 #include <GEL/HMesh/HarmonicMap.h>
+#include <GEL/HMesh/extrusion.h>
 
 #include <Eigen/Dense>
 #include <Eigen/Sparse>
 #include <GEL/Geometry/KDTree.h>
 #include <GEL/HMesh/load.h>
 
- /* ----------------------------------------------------------------------- *
-  * Struct to store an extrusion element
-  * ----------------------------------------------------------------------- */
-struct Extrusion {
-
-    HMesh::FaceID origin_face;
-    HMesh::FaceID right_face;
-
-    // TC: The responsible_faces is the face_set which an extrusion contributed to for the finished mesh
-    // stack_faces in this case are actually the face loop faces
-    HMesh::FaceSet base_face_set, stack_faces, responsible_faces;
-
-    HMesh::VertexID bd_v;
-    
-    HMesh::HalfEdgeID bd_h;
-
-    CGLA::Vec3d bd_v_pos;
-
-    CGLA::Vec3d right_vec;
-
-    CGLA::Vec2d bd_vs;
-
-    // Information for the bd_v responsible faceset
-    int bd_vs_responsible_extrusion;
-    HMesh::FaceSet ref_v_face_set;
-
-    int id = -1;
-
-    // TC: Variable made by TC
-    double scale = 1.0;
-
-    int stack_size = 0;
-
-    HMesh::HalfEdgeID curr_h;
-
-    // TC: The purpose of this boolean variable is basically to make a flag saying that an extrusion k + 1
-    // is using the base_face_set of extrusion k. In that way we avoid having to rely on the yellow_vertices and face-loops, 
-    // which might not work immediately, if hte base-patch might be kind a weird.
-    std::map<int, bool> contributing_extrusions_entire_base_patch;
-
-    // TC: Variable for storing which extrusions contribute with faces
-    std::vector<int> contributing_extrusions;
-
-    // A vector that stores which face ID belongs to which extrusion
-    HMesh::FaceAttributeVector<int> extrusion_id;
-
-    std::vector<int> child_nodes; // TC: The child nodes of the extrusion
-
-    std::stack<HarmonicMap> hmap_stack;
-
-    // This variable is used to store the boundary curves with (uv-coordinates) for each faceset that 
-    // we need to select. For convenience, we store each boundary curve as a Nx2 Eigen::Matrix with doubles.
-    std::map<int, std::vector<Eigen::MatrixXd>> next_gen_extrusion_loops;
-
-    // This variable is used to store the boundary curves with (uv-coordinates) for each faceset that 
-    // we need to select. For convenience, we store each boundary curve as a Nx2 Eigen::Matrix with doubles.
-    std::map<int, std::vector<HMesh::FaceSet>> next_gen_extrusion_face_sets;
-
-    std::map<int, CGLA::Vec2d> next_gen_extrusion_bd_vs;
-
-    // The state of the mesh after killing the extrusion
-    HMesh::Manifold m_state;
-
-    // The state of the mesh before killing the extrusion
-    HMesh::Manifold m_state_before;
-
-};
-
 
 /* ----------------------------------------------------------------------- *
- * The Generic Extrusion which is used to discretize the 2D continuous coordinates
- * of the Harmonic Map paramterized patches
+ * A simple data entity, which stores information about the previous and next extrusions
  * ----------------------------------------------------------------------- */
-class Generic_Extrusion{
-    
-    // The Manifold
-    HMesh::Manifold m;
-    
-    // Set the orientation
-    HMesh::FaceID origin_face;
-    HMesh::FaceID right_face;
-    HMesh::FaceID bd_f;
-    HMesh::VertexID ref_v;
-    HMesh::HalfEdgeID bd_h;
-    
-    // The faces in the middle of the shape
-    HMesh::FaceSet base_face_set;
-    
-    // Boundary vertices of the base fase set
-    std::vector<HMesh::VertexID> boundary_vertices;
+struct DAG_node {
+  int id;
+  std::deque<std::pair<int, std::string>> contributing_extrusions;
+  std::string extrusion_text;
+  std::string contributing_extrusion_text;
+  std::set<int> next_extrusions;
+  HMesh::FaceSet loop_faces;
 
-    // Boundary vertices on the entire extrusion (so the rim of the generic extrusion)
-    HMesh::VertexSet rim_vertices;
-    
-    // All the faces on the generic extrusion
-    HMesh::FaceSet curr_ext_faces;
-    
-    // The positions of the mesh
-    HMesh::VertexAttributeVector<CGLA::Vec3d> pos;
-    
-    // For the uv-map
-    std::map<HMesh::VertexID, std::pair<int, HMesh::VertexID>> base_loop_v_map;
-    
-    // For the vertex to uv_map
-    std::map<HMesh::VertexID, CGLA::Vec2d> vertex_uv_map;
- 
-    // GEL kDtree
-    Geometry::KDTree<CGLA::Vec2d, int> uv_tree;
-    
-    
-public:
-    
-    // Initialize the class function
-    Generic_Extrusion();
+  HMesh::Manifold base_base_mesh;
+  std::vector<HMesh::HalfEdgeID> bd_edges_base_base_patch;
+  std::map<HMesh::VertexID,CGLA::Vec2d> v_uv_map_base_base_patch;
+};
 
+/* ----------------------------------------------------------------------- *
+ * A Simple graph data structure, which stores nodes
+ * ----------------------------------------------------------------------- */
+class Extrusion_DAG{
+  private: 
+      std::vector<DAG_node> nodes;
 
-    // TC: The purpose of this function is
-    std::vector<HMesh::VertexID> get_neighbours(Eigen::MatrixXd curr_loop_V) {
-            
-        // Store the vertices of the found boundary loop
-        std::vector<HMesh::VertexID> closest_vertices;
+  public: 
+      Extrusion_DAG() = default;
 
-        // Loop through all the vertices in the loop
-        for (int ii = 0; ii < curr_loop_V.rows(); ii++) {
-            CGLA::Vec2d uv, uv_closest_point;
-            int index;
-            double inf = std::numeric_limits<double>::infinity();
-            
-            uv[0] = curr_loop_V(ii, 0);
-            uv[1] = curr_loop_V(ii, 1);
-            uv_tree.closest_point(uv, inf, uv_closest_point, index);
-            
-            // Insert the vertex ID into the list
-            closest_vertices.push_back(HMesh::VertexID(index));
-        }
-        return closest_vertices;
-    }
-    
-    HMesh::VertexID get_closest_vertex(CGLA::Vec2d uv_coordinate) {
-        CGLA::Vec2d uv_closest_point;
-        int index;
-        double inf = std::numeric_limits<double>::infinity();
-        uv_tree.closest_point(uv_coordinate, inf, uv_closest_point, index);
-        
-        return HMesh::VertexID(index);
+      // Method to add an item
+    void push_back(const DAG_node& node) {
+      nodes.push_back(node);
     }
 
-    HMesh::VertexID get_closest_vertex_on_the_rim(CGLA::Vec2d uv_coordinate) {
-        CGLA::Vec2d uv_closest_point;
-        int index;
-        double inf = std::numeric_limits<double>::infinity();
-        uv_tree.closest_point(uv_coordinate, inf, uv_closest_point, index);
-        auto v = HMesh::VertexID(index);
-        HMesh::VertexID v_on_rim;
-
-        circulate_vertex_ccw(m, v,[&](HMesh::VertexID vn){
-            if (rim_vertices.find(vn) != rim_vertices.end()) {
-              v_on_rim = vn; 
-            }
-        });
-        
-        return v_on_rim;
+    // Overload operator[] for access
+    DAG_node& operator[](size_t index) {
+        return nodes[index];
     }
-    
-    CGLA::Vec2d vertex_to_uv(HMesh::VertexID v_index) {
-        return vertex_uv_map.find(v_index)->second;
-    }
-    
-    // Get functions
-    std::map<HMesh::VertexID, CGLA::Vec2d> get_vertex_uv_map() {return vertex_uv_map;}
-    
-    HMesh::FaceSet get_curr_ext_faces() {return curr_ext_faces;}
-     
-    HMesh::VertexAttributeVector<CGLA::Vec3d> get_pos() {return pos;}
-    
-    HMesh::Manifold get_m() {return m;}
-    
-    std::vector<HMesh::VertexID> get_boundary_vertices() {return boundary_vertices;}
 
-    HMesh::VertexSet get_rim_vertices() {return rim_vertices;}
-    
-    HMesh::FaceSet get_base_face_set() {return base_face_set;}
+    const DAG_node& operator[](size_t index) const {
+        return nodes[index];
+    }
+
+    // Size of the collection
+    size_t size() const {
+        return nodes.size();
+    }
+
+    // Optional: begin/end to support range-based for loops
+    auto begin() { return nodes.begin(); }
+    auto end() { return nodes.end(); }
+
+    auto begin() const { return nodes.begin(); }
+    auto end() const { return nodes.end(); }
+
+    // Optional: clear, erase, etc.
+    void clear() {
+        nodes.clear();
+    }
+
+    void pop_back() {
+        nodes.pop_back();
+    }
+
+    bool empty() const {
+        return nodes.empty();
+    }
 };
 
 

@@ -1,8 +1,12 @@
 
-#include "feq.h"
-#include "gem.h"
-#include "face_loop.h"
-#include "HarmonicMap.h"
+
+#include <GEL/HMesh/feq.h>
+#include <GEL/HMesh/gem.h>
+#include <GEL/HMesh/face_loop.h>
+#include <GEL/HMesh/HarmonicMap.h>
+#include <GEL/HMesh/extrusion.h>
+#include <GEL/HMesh/HMesh.h>
+#include <GEL/HMesh/Manifold.h>
 
 using namespace std;
 using namespace CGLA;
@@ -14,40 +18,6 @@ using namespace Eigen;
 std::map<int,Extrusion> extrusion_tree;
 // Variable to store, whether a face is part of the base-base patch, or is on a face-loop
 std::map<HMesh::FaceID, bool> face_patch_flag;
-
-
-Generic_Extrusion::Generic_Extrusion() {
-    
-    if (!load(("gen_ext.obj"),m)) {
-        cout << "Could not load the generic extrusion" << endl;
-    };
-    
-    // Get the positions
-    pos = m.positions_attribute_vector();
-    
-    
-    for (auto f : m.faces()) {
-        curr_ext_faces.insert(f);
-    }
-    
-    for(auto v : all_verts(m, curr_ext_faces)) {
-        if(vertex_uv_map.find(v) == vertex_uv_map.end()) {
-            Vec2d uv = CGLA::Vec2d(m.pos(v)[0], m.pos(v)[1]);
-            vertex_uv_map.insert(std::make_pair(v, uv));
-      }
-    }
-
-    // Initialize the kDtree
-    for (auto it = vertex_uv_map.begin(); it != vertex_uv_map.end(); it++) {
-        uv_tree.insert(it->second, it->first.index);
-    }
-    uv_tree.build();
-
-    // Find rim vertices (boundary vertices on the entire extrusion)
-    // Note: There are no particular order, because we don't have a 'start vertex'
-    rim_vertices = boundary_verts(m, curr_ext_faces);
-    
-}
 
 /* ----------------------------------------------------------------------- *
  * TC: This function checks, whether a face-loop is self-adjacent. It basically means that for a face-loop on a FEQ-mesh, 
@@ -823,7 +793,7 @@ HMesh::FaceSet store_next_gen_extrusions_hmap(HMesh::Manifold &m, Extrusion& ext
 
 
             // TC: It seems like this just finds the boundary vertices of the curve.
-            std::vector<HMesh::VertexID> bd_verts = find_boundary_vertices(m, faceset, start_v);
+            std::vector<HMesh::VertexID> bd_verts = ccw_ordered_bd_vertices(m, faceset, start_v);
 
             Eigen::MatrixXd fs_loop;
 
@@ -1292,11 +1262,11 @@ void compute_new_bd_v_from_partial_prev_ext(Extrusion & ext) {
                     auto unordered_bd_vertices = boundary_verts(m, faceset);
 
                     if (unordered_bd_vertices.find(new_bd_v) != unordered_bd_vertices.end()) {
-                        bd_verts = find_boundary_vertices(m, faceset, new_bd_v);
+                        bd_verts = ccw_ordered_bd_vertices(m, faceset, new_bd_v);
 
                     }
                     else {
-                        bd_verts = find_boundary_vertices(m, faceset, *unordered_bd_vertices.begin());
+                        bd_verts = ccw_ordered_bd_vertices(m, faceset, *unordered_bd_vertices.begin());
                     }
                     MatrixXd fs_loop;
 
@@ -1993,3 +1963,1679 @@ std::pair< std::map<int,Extrusion>, std::map<HMesh::FaceID, std::tuple<int, std:
 }
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+/* ----------------------------------------------------------------------- *
+ * Converting a vector of vertices to a Nx2 matrix with continuous 2D coordinates
+ * ----------------------------------------------------------------------- */
+Eigen::MatrixXd find_yellow_loop(Generic_Extrusion& gen_ext, std::vector<HMesh::VertexID> yellow_vertices) {
+
+    Eigen::MatrixXd fs_loop;
+    
+    auto vertex_uv_map = gen_ext.get_vertex_uv_map();
+
+    // Loop through all the yellow vertices and count how many are actually valid
+    int counter = 0;
+    for (int ii = 0; ii < yellow_vertices.size(); ii++) {
+        // Insert values into Faceloop
+        auto v_id = yellow_vertices[ii];
+        if (vertex_uv_map.find(v_id) != vertex_uv_map.end()) {
+            counter += 1;
+        }
+    }
+
+    fs_loop.resize(counter, 2);
+    counter = 0;
+    for (int ii = 0; ii < yellow_vertices.size(); ii++) {
+        // Insert values into Faceloop
+        auto v_id = yellow_vertices[ii];
+        if (vertex_uv_map.find(v_id) != vertex_uv_map.end()) {
+            auto uv = vertex_uv_map.find(v_id)->second;
+            fs_loop(counter, 0) = uv[0];
+            fs_loop(counter, 1) = uv[1];
+            counter += 1;
+        }
+    }
+
+    return fs_loop;
+}
+
+
+
+/* ----------------------------------------------------------------------- *
+ * Code to perform the actual extrusion
+ * ----------------------------------------------------------------------- */
+std::tuple<HarmonicMap, std::map<HMesh::VertexID, CGLA::Vec3d>, std::map<HMesh::VertexID, CGLA::Vec2d>, HMesh::Manifold> perform_extrusion(Manifold &m, bool triangulation_needed, Extrusion ext, FaceSet& face_set, std::vector<std::tuple<HMesh::FaceSet, bool, bool, std::string, int>>& faces_2_be_extruded, VertexID &bd_v, double src_len, double tgt_len, FaceSet& curr_ext_faces, FaceSet& face_loop_faces, FaceSet& base_patch_faces, std::map<HMesh::VertexID, CGLA::Vec2d>& vertex_uv_map, int extrusion_counter) {
+
+    ext.bd_v = bd_v;
+
+    stack<HarmonicMap> transform_stack = ext.hmap_stack;
+    
+    double target_bd_perim = tgt_len;
+
+    double source_bd_perim = src_len;
+
+    FaceID bd_f; int ccw_count = 0; int bd_count = 0;
+
+    // Triangulate the face_set - and update faces_2_be_extruded
+    // ------------------------------------------------------------------------
+    if (triangulation_needed) {
+        std::vector<HMesh::VertexID> new_vertices;
+        std::map<HMesh::FaceID, HMesh::VertexID> f_v_map;
+        HMesh::FaceSet non_splitted_faces;
+        // Triangulate each face
+        for(auto f : face_set) {
+            if (face_valency(m,f) != 3) {
+            
+                auto new_v = m.split_face_by_vertex(f); 
+                new_vertices.push_back(new_v);
+                f_v_map.insert({f, new_v});
+                
+            }
+            else {
+                non_splitted_faces.insert(f);
+            }
+        }
+        // Clean face_set and insert the non_splitted_faces faces and faces by circling around each new face
+        face_set.clear();
+
+        for (auto f : non_splitted_faces) {
+       
+            face_set.insert(f);
+        }
+        for (auto v : new_vertices) {
+            circulate_vertex_ccw(m, v, [&] (HMesh::FaceID fn) {
+                face_set.insert(fn);
+          
+            });
+        }
+        // ------------------------------------------------------------------------
+        // Update faces_2_be_extruded
+        for (auto &it : faces_2_be_extruded) {
+            auto old_fs = std::get<0>(it);
+            HMesh::FaceSet new_fs;
+
+       
+            for (auto f : old_fs) {
+            
+                if (non_splitted_faces.find(f) != non_splitted_faces.end()) {
+                    new_fs.insert(f);
+                 
+                }
+                else {
+                    circulate_vertex_ccw(m, f_v_map.find(f)->second, [&] (HMesh::FaceID fn) {
+                        new_fs.insert(fn);
+                 
+                    });
+                }
+            }
+            std::get<0>(it) = new_fs;
+        }
+        // ------------------------------------------------------------------------
+    }
+
+
+    for (auto &it : faces_2_be_extruded) {
+        // Furthermore, set the second variable (bool value) to true, because if we are going to use the exact same faceset, then it comes from a base-patch
+        std::get<1>(it) = true; 
+    }
+
+
+    for(auto f : face_set) {
+      ccw_count = 0;
+      circulate_face_ccw(m, f, [&] (HalfEdgeID h) {
+        if(m.walker(h).vertex() == ext.bd_v) {
+          bd_f = f;
+          bd_count = ccw_count;
+        }
+        ccw_count++;
+      });
+    }
+
+    HMesh::Manifold prev_m = m;
+
+    
+    int index_count = 0;
+
+    // TC: Do the extrusion itself.
+    HarmonicMap target_hmap;
+    HarmonicMap source_hmap;
+    std::map<HMesh::VertexID, CGLA::Vec3d> bd_v_positions;
+    std::map<HMesh::VertexID, CGLA::Vec2d> prev_v_uv_map;
+
+    std::tuple<HarmonicMap,  std::map<HMesh::VertexID, CGLA::Vec3d>, std::map<HMesh::VertexID, CGLA::Vec2d>, HMesh::Manifold> result;
+
+
+    while(!transform_stack.empty()) {
+        source_hmap = transform_stack.top();
+        transform_stack.pop();
+
+        // Make the map high resolution - 2.12.2025
+        //transform_map.makeHighResMap(ext.id);
+
+        // TC: Changed 25.4.2025
+        smooth_faceset_lap_solve(m, face_set);
+
+        // TC: We can just keep adding faces to "recon_faces" and "curr_ext_faces" even though we have already added them once,
+        // because when we use the command .insert(f_id), the list first checks, if the f_id is already in the list. If not, it is inserted,
+        // but if f_id is in the list, then f_id is not inserted again.
+        for(auto f_id : face_set) {
+          curr_ext_faces.insert(f_id);
+          base_patch_faces.insert(f_id);
+        }
+
+        FaceSet new_faces = extrude_face_set(m, face_set);
+
+        for(auto f_id : new_faces) {
+          curr_ext_faces.insert(f_id);
+          if (base_patch_faces.find(f_id) == base_patch_faces.end()) {
+            face_loop_faces.insert(f_id);
+          }
+        }
+
+        ccw_count = 0;
+
+        auto prev_bd_v = ext.bd_v;
+        
+        
+        circulate_face_ccw(m, bd_f, [&] (HalfEdgeID h) {
+          if(ccw_count == bd_count) {
+            ext.bd_v = m.walker(h).vertex();
+            bd_v = m.walker(h).vertex();
+          }
+          ccw_count++;
+        });
+
+        std::map<HMesh::VertexID, CGLA::Vec2d> empty_uv_map;
+        auto extrusion_result = geometric_extrude_face_set_hmap_perim_normalized(m, ext, face_set, source_hmap, target_bd_perim, source_bd_perim, extrusion_counter);
+
+        std::get<0>(result) = std::get<0>(extrusion_result);
+        std::get<1>(result) = std::get<1>(extrusion_result);
+        std::get<2>(result) = std::get<2>(extrusion_result);
+        std::get<3>(result) = prev_m;
+    
+        index_count++;
+
+    }
+    
+    VertexAttributeVector<Vec3d> old_pos =  m.positions_attribute_vector();
+
+    smooth_faceset_lap_solve(m, face_set);
+
+
+    std::string ordinary_extrusion_name = "ordinary_with_smoothing_reconstruction_ext_" + std::to_string(extrusion_counter);
+    HarmonicMap hmap(m, face_set, ext.bd_v, ordinary_extrusion_name);
+
+    std::string extrusion_name = "reconstruction_with_smoothing_ext_" + std::to_string(extrusion_counter);
+    bool save_mesh = true;
+
+    // This should actually be changed, because vertex_uv_map is not the same as target_hmap then, because we compute it after the extrusion
+    // has been applied. 
+    //vertex_uv_map = hmap.compute_normal_harmonic_map_with_face_loop(m, extrusion_name, save_mesh, HMesh::InvalidVertexID);
+
+    m.positions_attribute_vector() = old_pos;
+
+    // Changes made by TC - 8.1.2026
+    vertex_uv_map = hmap.get_v_uv_map(m, extrusion_name, true);
+
+    return result;
+}
+
+
+/* ----------------------------------------------------------------------- *
+ * The purpose of this function is to cut up the base-patch faces according to the face-loop curves
+ * We return a list of extrusion_id + yellow_faces + bd_v + bool (whether the patch is inside or outside)
+ * ----------------------------------------------------------------------- */
+std::vector<std::tuple<int, HMesh::FaceSet, HMesh::VertexID, bool, std::vector<HMesh::VertexID>>> find_extrusion_area(HMesh::Manifold& m, 
+                                                                                                                    HMesh::Manifold m_state, 
+                                                                                                                    HMesh::FaceSet& face_loop_faces, 
+                                                                                                                    HMesh::FaceSet& base_patch_faces, 
+                                                                                                                    std::map<HMesh::VertexID, CGLA::Vec2d>& v_uv_map, 
+                                                                                                                    std::vector<std::tuple<int, MatrixXd, CGLA::Vec2d, std::vector<HMesh::VertexID>>> all_loops, 
+                                                                                                                    std::map<HMesh::VertexID, std::tuple<CGLA::Vec2d, HMesh::VertexID, HMesh::VertexID, double>>& new_vertices,
+                                                                                                                    std::map<HMesh::VertexID, CGLA::Vec2d> prev_v_uv_map,
+                                                                                                                    bool use_split, 
+                                                                                                                    std::string filename,
+                                                                                                                    Generic_Extrusion &gen_ext,
+                                                                                                                    HMesh::Manifold base_base_mesh,
+                                                                                                                    std::vector<HMesh::HalfEdgeID> bd_edges_base_base_patch,
+                                                                                                                    std::map<HMesh::VertexID,CGLA::Vec2d> v_uv_map_base_base_patch) {
+
+
+    //cout << "Inside find_extrusion_area" << endl;
+    //cout.flush();
+
+    HMesh::FaceSet curr_ext_faces;
+    curr_ext_faces.insert(face_loop_faces.begin(), face_loop_faces.end());
+    curr_ext_faces.insert(base_patch_faces.begin(), base_patch_faces.end());
+    HMesh::FaceSet base_patch_faces_copy = base_patch_faces;
+
+    // Find the halfedges of the face-loop faces which bounds the base_patch_faces
+    auto base_patch_bd_edges = find_boundary_edges_from_ref_v(m_state, base_patch_faces, *boundary_verts(m_state, base_patch_faces).begin());
+    std::vector<HMesh::HalfEdgeID> face_loop_upper_bd_edges;
+    for (auto h : base_patch_bd_edges) {
+        face_loop_upper_bd_edges.push_back(m.walker(h).opp().halfedge());
+    }
+ 
+    std::vector<std::tuple<int, std::vector<CGLA::Vec2d>, CGLA::Vec2d, std::vector<HMesh::VertexID>, bool>> curves_inside_patch; // The curves that sourround interior patch faces
+    std::vector<std::tuple<int, MatrixXd, CGLA::Vec2d, std::vector<HMesh::VertexID>, bool>> curves_outside_patch; // The curves that sourround face-loop faces
+
+    // Detect whether each curve is a face-loop curve or a patch curve
+    for (int ii = 0; ii < all_loops.size(); ii++) {
+        
+        int extrusion_no = std::get<0>(all_loops[ii]); //.first;
+        auto curr_loop_V = std::get<1>(all_loops[ii]); //.second;
+        auto bd_v_coordinates = std::get<2>(all_loops[ii]); // third
+        auto yellow_vertices = std::get<3>(all_loops[ii]); // third
+        
+        // No points outside the unit circle
+        int no_points_outside_unit_circle = 0;
+
+        // Curve
+        std::vector<CGLA::Vec2d> curve;
+        //cout << "curve and extrusion_no: " << extrusion_no << endl;
+        for (int ii = 0; ii < curr_loop_V.rows(); ii++) {
+            auto uv = CGLA::Vec2d(curr_loop_V(ii,0), curr_loop_V(ii,1));
+            if (length(uv) > 1.05) {
+                no_points_outside_unit_circle += 1;
+            }
+            curve.push_back(uv);
+            //cout << "[" << curr_loop_V(ii,0) << "," << curr_loop_V(ii,1) << "]," << endl;
+        }
+
+        // Detect, whether the curve is mostly inside or outside the unit circle - so whether it encapsels faces on the face-loop or on the base-patch
+        double total_area = area_of_polygon(curr_loop_V);
+        double area_inside_circle = area_of_curve_inside_circle(curr_loop_V);
+        bool use_base_patch_faces = false;
+
+        if (area_inside_circle > 1e-5 && area_inside_circle >= total_area/2.0 && no_points_outside_unit_circle == 0) {
+            curves_inside_patch.push_back({extrusion_no, curve, bd_v_coordinates, yellow_vertices, true});
+        }
+        else {
+            curves_outside_patch.push_back({extrusion_no, curr_loop_V, bd_v_coordinates, yellow_vertices, false});
+        }
+    }
+
+    // ----------------------------------------------------------------------
+    // The results - A Curve_id + <yellow_faces, bd_v>
+    // ----------------------------------------------------------------------
+    std::vector<std::tuple<int, HMesh::FaceSet, HMesh::VertexID, bool, std::vector<HMesh::VertexID>>> results;
+    
+    std::vector<CGLA::Vec2d> all_curve_points;
+
+    // ----------------------------------------------------------------------
+    // Split the faces in the base patch
+    // ----------------------------------------------------------------------
+    //if (curves_inside_patch.size() > 0 && use_split) {
+    if (use_split) {
+
+        if (curves_inside_patch.size() > 0) {
+
+            // Storing the altered curves
+            std::vector<std::tuple<int, std::vector<std::tuple<CGLA::Vec2d, HMesh::VertexID, bool, HMesh::HalfEdgeID>> , CGLA::Vec2d, std::vector<HMesh::VertexID> >> altered_curves;
+
+
+            Geometry::KDTree<CGLA::Vec2d, HMesh::VertexID> bd_verts_tree;
+            // Initialize the tree
+            for (auto v : boundary_verts(m_state, base_patch_faces)) {
+                bd_verts_tree.insert(v_uv_map.find(v)->second, v);
+            }
+            bd_verts_tree.build();
+
+            // Loop through all face_loop faces and find possible intersections
+            for (auto it : curves_inside_patch) {
+
+                auto extrusion_id = std::get<0>(it); // .first;
+                auto curve = std::get<1>(it); //.second;
+                auto bd_v_coor = std::get<2>(it);
+                auto yellow_vertices = std::get<3>(it);
+
+                double radius = 0.1;
+
+                // Move curve to the boundary
+                auto curve_to_boundary = contract_curve(m_state, base_patch_faces, v_uv_map, curve, radius, bd_verts_tree);
+
+
+                // Move curve edges that do not have an endpoint close to a boundary vertex to the boundary
+                auto curve_extended = move_segment_to_boundary(m_state, base_patch_faces, v_uv_map, curve_to_boundary);
+
+                // Subdivide curve  
+                // If the curve has lower resolution than the patch, then very slim triangles will be created. Consequently, we need to sample some more points, 
+                // and we could do that by just sampling a point at every intersection between a curve segment and an edge in the patch
+                curve_extended = subdivide_curve(m_state, base_patch_faces, v_uv_map, curve_extended);
+
+                // Repeat this step,
+                // After we have subdivided, there might be new points (created from the intersections between curve edges and patch edges), and these
+                // points might be close to the boundary points
+                // Commented out on 11.1.2026
+                //curve = contract_curve(m_state, base_patch_faces, v_uv_map, curve, radius, bd_verts_tree);
+
+                // Snap the curve points that are not on the boundary to a vertex in the interior of the base-patch, if the vertex has a distance of 
+                // 0.1% of the minimum edge distance to the vertex
+                double threshold = 0.1;
+                curve_extended = snap_curve_points(m, base_patch_faces, v_uv_map,  curve_extended,  threshold);
+
+
+                altered_curves.push_back(std::tuple(extrusion_id, curve_extended, bd_v_coor, yellow_vertices));
+            }   
+
+            
+
+            auto curve_enclosed_faces = insert_curve_points_into_qm(m, 
+                                                                base_patch_faces, 
+                                                                v_uv_map, 
+                                                                altered_curves, 
+                                                                prev_v_uv_map,
+                                                                new_vertices, 
+                                                                filename);
+
+
+
+
+            // ----------------------------------------------------------------------
+            // Find the faces 
+            // ----------------------------------------------------------------------
+            for (auto it : curve_enclosed_faces) {
+                auto extrusion_id = std::get<0>(it); //.first;
+                auto yellow_faces = std::get<1>(it); //.second;
+                auto bd_v_coor = std::get<2>(it);
+                auto yellow_vertices = std::get<3>(it);
+            
+                HMesh::VertexID bd_v = HMesh::InvalidVertexID;
+
+                results.push_back(std::make_tuple(extrusion_id, yellow_faces, bd_v, true, yellow_vertices));
+            }
+        }
+    }
+
+    // ----------------------------------------------------------------------
+    // Do not split the faces
+    // ----------------------------------------------------------------------
+    // If we are not splitting faces, we need to insert all curves into the curves_outside_patch
+    if (!use_split) {
+       
+        for (auto it : curves_inside_patch) {
+
+            HMesh::FaceSet faces_already_occupied;
+
+            auto extrusion_id = std::get<0>(it); //.first;
+            auto curve = std::get<1>(it);
+
+            //cout << "Finding the yellow faces for non-split for extrusion " << extrusion_id << endl;
+            //cout << "curr_loop_V is: " << endl;
+
+            MatrixXd curr_loop_V;
+            curr_loop_V.resize(curve.size(), 2);
+            for (int ii = 0; ii < curve.size(); ii++) {
+                curr_loop_V(ii,0) = curve[ii][0];
+                curr_loop_V(ii,1) = curve[ii][1];
+                //cout << "[" << curr_loop_V(ii,0) << "," << curr_loop_V(ii,1) << "]," << endl;
+            }
+
+            auto bd_v_coor = std::get<2>(it);
+            auto yellow_vertices = std::get<3>(it);
+            auto is_inside_patch = true;
+
+            // -----------------------------
+            // The yellow faces that will be extruded
+            // -----------------------------
+            HMesh::FaceSet yellow_faces;
+
+
+            MST mst(m_state, curr_ext_faces, v_uv_map, curr_loop_V);
+            auto [cycle, min_dist, min_edge] = mst.find_curve();
+            
+            // -------------------------
+            // Find faces enclosed by the cycle
+            // Just use midpoint of each face
+            // -------------------------
+            map<int, FaceID> uv_face_map;
+            vector<Vec2d> face_uvs;
+            MatrixXd f_uvs;
+            f_uvs.resize(curr_ext_faces.size(), 2);
+
+            int i = 0;
+            for (auto f : curr_ext_faces) {
+
+                CGLA::Vec2d uv_centre = Vec2d(0.0);
+                circulate_face_ccw(m_state, f, [&] (VertexID v) {
+                    Vec2d uv = v_uv_map.find(v)->second;
+                    uv_centre += uv;
+                });
+
+                uv_centre /= 4.0;
+                face_uvs.push_back(uv_centre);
+                f_uvs(i , 0) = uv_centre[0];
+                f_uvs(i , 1) = uv_centre[1];
+
+                //cout << "Face: " << f << " has uv-coordinates: [" << uv_centre[0] << "," << uv_centre[1] << "]" << endl;
+
+                uv_face_map.insert(std::make_pair(i, f));
+                i++;
+            }
+
+            MatrixXi loop_F;
+
+            MatrixXd w;
+
+            double eps = 1e-6;
+
+            int N = cycle.size();
+            loop_F.resize(N, 2);
+
+            for(int i = 0; i < N; i++) {
+                loop_F(i, 0) = i;
+                loop_F(i, 1) = (i+1)%N;
+            }
+
+            // -------------------------
+            // Compute the uv-coordinates of the cycle
+            // -------------------------
+            Eigen::MatrixXd cycle_uvs;
+            cycle_uvs.resize(N, 2);
+            for(int i = 0; i < N; i++) {
+                auto v = HMesh::VertexID(cycle[i]);
+                auto uv = v_uv_map.find(v)->second;
+                cycle_uvs(i, 0) = uv[0];
+                cycle_uvs(i, 1) = uv[1];
+            }
+            // -------------------------
+            // Compute the winding number for each face
+            // -------------------------
+            igl::winding_number(cycle_uvs, loop_F, f_uvs, w);
+
+            for(int i = 0; i < w.rows(); i++) {
+                //cout << "winding number for face " << uv_face_map.find(i)->second << ": " << w(i) << endl;
+                if(abs(w(i)) > eps) {
+                    auto f_id = uv_face_map.find(i)->second;
+                    if (faces_already_occupied.find(f_id) == faces_already_occupied.end()) {
+                        yellow_faces.insert(f_id);
+                        faces_already_occupied.insert(f_id);
+                    }
+                }
+            }
+
+            HMesh::VertexID ref_v;
+            if (length(bd_v_coor) > 1.5) {
+                ref_v = HMesh::InvalidVertexID;
+            }
+            else {
+                ref_v = cycle.front();
+            }
+
+            results.push_back(std::make_tuple(extrusion_id, yellow_faces, ref_v, is_inside_patch, yellow_vertices));
+
+        }
+            
+    }
+    for (auto it : curves_outside_patch) {
+
+        auto curr_loop_V = std::get<1>(it);
+
+        std::vector<HMesh::HalfEdgeID> loop_edges;
+
+        int start_index = 0;
+        int end_index = 0;
+        auto origin = CGLA::Vec2d(0.0);
+        auto start_point = CGLA::Vec2d(curr_loop_V(0,0), curr_loop_V(0,1));
+        auto end_point = CGLA::Vec2d(curr_loop_V(1,0), curr_loop_V(1,1));
+        
+        // ---------------------------------
+        // Starting point
+        // ---------------------------------
+        for (int jj = 0; jj < bd_edges_base_base_patch.size(); jj++) {
+            auto start_edge = bd_edges_base_base_patch[jj];
+            auto result_starting_point = do_edge_intersect_curve_t_value(base_base_mesh, start_edge, origin, start_point, v_uv_map_base_base_patch);
+            // It is closer to the beginning of the edge
+            if (result_starting_point.first && result_starting_point.second < 0.5) {
+                start_index = jj;
+            }
+            // It is actually closer to the end of the edge
+            else if (result_starting_point.first && result_starting_point.second > 0.5 || is_point_on_the_line(v_uv_map_base_base_patch.find(base_base_mesh.walker(start_edge).vertex())->second, origin, start_point)) {
+                start_index = (jj + 1)%bd_edges_base_base_patch.size();
+            }
+
+            auto end_edge = bd_edges_base_base_patch[jj];
+            auto result_end_point = do_edge_intersect_curve_t_value(base_base_mesh, end_edge, origin, end_point, v_uv_map_base_base_patch);
+            // It is closer to the beginning of the edge
+            if (result_end_point.first && result_end_point.second > 0.5 || is_point_on_the_line(v_uv_map_base_base_patch.find(base_base_mesh.walker(end_edge).vertex())->second, origin, end_point)) {
+                end_index = jj;
+      
+            }
+            // It is actually closer to the end of the edge
+            else if (result_end_point.first && result_end_point.second < 0.5) {
+                end_index = (jj - 1  + bd_edges_base_base_patch.size())%bd_edges_base_base_patch.size();
+                
+            }
+        }
+
+        auto start_edge = bd_edges_base_base_patch[start_index];
+        auto end_edge = bd_edges_base_base_patch[end_index];
+        
+
+        // Insert the edges into loop_edges
+        int stop_index = bd_edges_base_base_patch.size() + end_index;
+        //cout << "stop_index: " << stop_index << endl;
+        if (end_index >= start_index) {
+            stop_index = end_index;
+        }
+        // We need to include the last one
+        //cout << "The original loop_edges are: " << endl;
+        for (int jj = start_index; jj < stop_index + 1; jj++) {
+            auto edge_index = jj%bd_edges_base_base_patch.size();
+            auto edge = bd_edges_base_base_patch[edge_index];
+            loop_edges.push_back(edge);
+            //cout << edge << " ";
+        }
+        
+        HMesh::FaceSet yellow_faces;
+        for (auto h : loop_edges) {
+            
+            yellow_faces.insert(m_state.walker(h).opp().face());
+        }
+
+        auto extrusion_id = std::get<0>(it); //.first;
+        auto yellow_vertices = std::get<3>(it);
+        HMesh::VertexID ref_v = HMesh::InvalidVertexID;
+
+        results.push_back(std::make_tuple(extrusion_id, yellow_faces, ref_v, false, yellow_vertices));
+
+        
+    }
+
+    return results;
+}
+
+
+/* ----------------------------------------------------------------------- *
+ * The purpose of this function is to make a look-ahead in the construction sequence, and find dependent extrusions, so if extrusion X contributes to extrusion Y and Z, 
+ * We need to find both Y and Z, and figure out, which areas of the base patch and face-loop, extrusion Y and Z depends on.
+ * ----------------------------------------------------------------------- */
+std::vector<std::vector<std::string>> find_dependent_extrusions(std::vector<std::string> look_ahead, string extrusion_name) {
+
+    std::vector<std::vector<std::string>> next_extrusions;
+
+    for (int ii = 0; ii < look_ahead.size() - 1; ii++) {
+        auto gp_command = look_ahead[ii];
+        auto prev_extrusion_command = look_ahead[ii+1];
+
+        if (gp_command == "gp" && prev_extrusion_command == extrusion_name) {
+
+            std::vector<std::string> selection_set;
+            int counter = 0;
+
+            // Track backwards to find the starting point of "sv". If we hit something, which is not "gp", "PX", an integer or "sv", then we stop
+            while (ii + counter > 0 && look_ahead[ii + counter] != "sv" && look_ahead[ii + counter] != "Re" && look_ahead[ii + counter].at(0) != 'E') {
+                counter -= 1;
+            }
+
+            // Select all the vertices
+            if (look_ahead[ii + counter] == "sv") {
+                counter += 1;
+               
+                while (ii + counter < look_ahead.size() && isInteger(look_ahead[ii + counter])) {
+                    selection_set.push_back(look_ahead[ii + counter]);
+                    counter += 1;
+                }
+            }
+
+            // Find the boundary vertex by looking at the text in front of "gp PX"
+            if (ii + 1 < look_ahead.size() && look_ahead[ii + 1] == "bd") {
+                selection_set.push_back(look_ahead[ii + 1]);
+
+                selection_set.push_back(look_ahead[ii + 2]);
+    
+            }
+            // Find the extrusion number, which the loop belongs to. E.g. we need to have the sequence 
+            // gp P29 sv x1 x2 x3 E109, so we find the x1 x2 x3 that make up the loop, and then E109, which make up the 
+            // extrusion number. This can for instance happen, when we have: gp P29 sv x1 x2 x3 gp PZ z1 z2 z3 E109,
+            // then we just need to find the extrusion number.
+            while (ii + counter < look_ahead.size() && look_ahead[ii + counter].at(0) != 'E') {
+                counter += 1;
+            }
+  
+            // We cannot rely on the extrusion ID EX (where X is some number), because this number is not unique, when we start to make clusters. Instead we should 
+            // use the ID PX, where X is the extrusion number, as this is unique. In the construction sequence we always have EX PY, so we just need to fetch PY. Therefore, we just increase the counter by 1.
+            counter += 1;
+
+            // Do not include those extrusions that depend on the entire base patch
+            // Only include those that depend on a sub part of the base patch
+            if (selection_set.size() > 0) {
+                // This is the ID of the extrusion
+                std::string extrusion_id;
+                if (ii + counter < look_ahead.size()) {
+ 
+                    extrusion_id = look_ahead[ii + counter];
+                    selection_set.push_back(look_ahead[ii + counter]);
+                }
+
+                // Make sure that it is actually a proper extrusion ID - E.g. if the ID is missing, because
+                // the sequence has been generated by the LLM, then we should not include it.
+                if (!extrusion_id.empty() && extrusion_id.at(0) == 'P') {
+                    next_extrusions.push_back(selection_set);
+                }
+            }
+        }
+    }
+
+    return next_extrusions;
+}
+
+
+bool does_the_base_patch_need_to_be_triangulated(std::vector<string> look_ahead, queue<string> command_buffer) {
+
+    int previous_extrusion_id = -1;
+    if (!command_buffer.empty() && command_buffer.front().at(0) == 'P' && isInteger(command_buffer.front().substr(1))) {
+        previous_extrusion_id = stoi(command_buffer.front().substr(1));
+    }
+    else {
+        return false;
+    }
+
+    Generic_Extrusion gen_ext;
+
+    bool need_triangulation = false;
+
+    std::string extrusion_name = "P" + to_string(previous_extrusion_id);
+    auto next_extrusions = find_dependent_extrusions(look_ahead, extrusion_name);
+
+    std::vector<std::tuple<int, MatrixXd, CGLA::Vec2d, std::vector<HMesh::VertexID>>> loops;
+
+    //cout << "The next extrusions found are: " << endl;
+    //cout.flush();
+    for (auto selection_set : next_extrusions) {
+        CGLA::Vec2d bd_v_coordinates = CGLA::Vec2d(2.0, 0.0); // The coordinates of the boundary vertex - Just set it to some value, which is outside the unit circle
+
+        std::vector<HMesh::VertexID> yellow_vertices;
+        for (int jj = 0; jj < selection_set.size()-1; jj++) {
+            //cout << "selection_set[jj]: " << selection_set[jj] << endl;
+            cout.flush();
+            if (selection_set[jj] == "bd" || (jj >= 1 && selection_set[jj-1] == "bd")) {
+                if (isInteger(selection_set[jj])) {
+                    bd_v_coordinates = gen_ext.get_vertex_uv_map().find(HMesh::VertexID(stoi(selection_set[jj])))->second;
+                }
+            }
+            else {
+                if (isInteger(selection_set[jj])) {
+                    yellow_vertices.push_back(HMesh::VertexID(stoi( selection_set[jj] )));
+                }
+            }
+        }
+        MatrixXd curr_loop_V = find_yellow_loop(gen_ext, yellow_vertices);  
+
+        int extrusion_id = stoi(selection_set[selection_set.size()-1].substr(1));
+
+        loops.push_back(std::tuple(extrusion_id, curr_loop_V, bd_v_coordinates, yellow_vertices));
+    }
+
+    // Detect whether each curve is a face-loop curve or a patch curve
+    for (int ii = 0; ii < loops.size(); ii++) {
+        
+        int extrusion_no = std::get<0>(loops[ii]); //.first;
+        auto curr_loop_V = std::get<1>(loops[ii]); //.second;
+        auto bd_v_coordinates = std::get<2>(loops[ii]); // third
+        auto yellow_vertices = std::get<3>(loops[ii]); // third
+        
+        // No points outside the unit circle
+        int no_points_outside_unit_circle = 0;
+
+        // Curve
+        std::vector<CGLA::Vec2d> curve;
+        for (int ii = 0; ii < curr_loop_V.rows(); ii++) {
+            auto uv = CGLA::Vec2d(curr_loop_V(ii,0), curr_loop_V(ii,1));
+            if (length(uv) > 1.05) {
+                no_points_outside_unit_circle += 1;
+            }
+            curve.push_back(uv);
+        }
+
+        // Detect, whether the curve is mostly inside or outside the unit circle - so whether it encapsels faces on the face-loop or on the base-patch
+        double total_area = area_of_polygon(curr_loop_V);
+        double area_inside_circle = area_of_curve_inside_circle(curr_loop_V);
+        bool use_base_patch_faces = false;
+
+        if (area_inside_circle > 1e-5 && area_inside_circle >= total_area/2.0 && no_points_outside_unit_circle == 0) {
+            need_triangulation = true;
+        }
+    }
+
+
+    return need_triangulation;
+}
+
+
+/* ----------------------------------------------------------------------- *
+ * This function can run the new and short version.
+ * ----------------------------------------------------------------------- */
+Extrusion_DAG run_extrusion_sequence_using_boundaries(Manifold &m, FaceSet patch_faces, VertexID bd_v, string construction_sequence, string ext_directory, bool use_split, bool use_clustered_extrusions) {
+    // patch_faces = The faces in the base patch
+
+    Extrusion_DAG ext_DAG;
+
+    // TC: Create the generic extrusion
+    
+    Generic_Extrusion gen_ext; // TC: Generic Extrusion
+
+    // TC: Turn the construction sequence into commands
+    std::istringstream iss(construction_sequence);
+    queue<string> command_buffer;
+    std::string word;
+
+    while (iss >> word) {
+        command_buffer.push(word);
+    }
+
+    // TC: String look-a-head needed for finding extrusion areas
+    std::istringstream iss2(construction_sequence);
+    std::vector<string> look_ahead;
+    while (iss2 >> word) {
+        look_ahead.push_back(word);
+    }
+    
+    //cout<<"Running extrusion script"<<endl;
+    
+    // TC: Extrusiosn directory
+    //filesystem::path extrusions_directory = "extrusions";
+    filesystem::path extrusions_directory;
+    if (!ext_directory.empty()) {
+        extrusions_directory = filesystem::path(ext_directory);
+    }
+    else {
+        extrusions_directory = filesystem::path("clustered_extrusions") / "all";
+    }
+
+    //cout <<  "We are making use of the following extrusions_directory: " << extrusions_directory << endl;
+    
+    // TC: Initialize the cycle counter
+    int cycle_counter = 0;
+    
+    // TC: Define variables needed for the extrusion
+    Extrusion ext;
+    // Faces responsible for the boundary vertex
+    HMesh::FaceSet bd_v_face_set;
+    // The Veretx uv map for that extrusion
+    std::map<HMesh::VertexID,CGLA::Vec2d> bd_v_vertex_uv_map;
+    Eigen::MatrixXd bd_v_curr_loop_V;
+
+
+    // TC: The data necessary for choosing the faces - get previous extrusions and so forth
+    // Store name of extrusion - e.g. P5
+    // Store the extrusion counter
+    // Store the mesh m
+    // Store the face_loop_faces
+    // Store the base_patch_faces
+    // Store the vertex_uv_map
+    // Store the bd_v
+    // Store the face_use map
+    // Boundary edges of the base-base-patch
+    // v_uv_map of the base-base_patch
+    std::map<int, std::pair<int, std::tuple<HMesh::Manifold, 
+                                            HMesh::FaceSet, 
+                                            HMesh::FaceSet, 
+                                            std::map<HMesh::VertexID,CGLA::Vec2d>, 
+                                            HMesh::VertexID, 
+                                            std::map<HMesh::FaceID, bool>,
+                                            HMesh::Manifold, 
+                                            std::vector<HMesh::HalfEdgeID>,
+                                            std::map<HMesh::VertexID,CGLA::Vec2d>
+                                            >>> face_map;
+
+    std::map<HMesh::FaceID, std::map<HMesh::VertexID,CGLA::Vec2d>> f_2_v_uv_map;
+
+    HMesh::Manifold base_base_mesh = m;
+    std::vector<HMesh::HalfEdgeID> bd_edges_base_base_patch;
+    std::map<HMesh::VertexID,CGLA::Vec2d> v_uv_map_base_base_patch;
+
+    bd_edges_base_base_patch = ccw_ordered_bd_edges(m, patch_faces, bd_v);
+    HarmonicMap initial_map(m, patch_faces, bd_v, "");
+    for (auto v : all_verts(m, patch_faces)) {
+        v_uv_map_base_base_patch.insert({v, initial_map.patch_vertex_uv(v)});
+    }
+
+    
+    // TC: Set the face set
+    FaceSet prev_face_set;
+    FaceSet face_set = patch_faces;
+    
+    VertexAttributeVector<Vec3d> pre_ext_pos = m.positions_attribute_vector();
+
+    VertexAttributeVector<Vec3d> post_ext_pos = m.positions_attribute_vector();
+
+    int extrusion_counter = 0;
+
+    // TC: Flag for saving intermediate meshes
+    bool save_intermediate_meshes = false;
+    bool save_intermediate_extrusions = false;
+    
+    // TC: Information needed for the next extrusion
+    FaceID bd_f; int ccw_count = 0; int bd_count = 0;
+
+    // Boundary perimeter
+    double target_boundary_perim;
+
+    // TC: Variables needed to do a re-extrusion of the vertices inserted in faces and in meshes
+    HarmonicMap target_hmap;
+    std::map<HMesh::VertexID, CGLA::Vec2d> prev_v_uv_map;
+    std::map<HMesh::VertexID, CGLA::Vec3d> bd_v_positions;
+
+    // TC: Global variables needed when performing an extrusion
+    FaceSet curr_ext_faces;
+    // The variables in faces_2_be_extruded
+    // HMesh::FaceSet --> The faces from the extrusion, which is about to be extruded
+    // bool --> Whether the faceset comes from the base patch or from the face loop of the previous extrusion
+    // bool --> Whether the faces from this extrusion is responsible for the ref_v (boundary vertex)
+    // string --> The ID of a vertex on the generic extrusion, which gives the (u,v)-coordinates for the ref_v
+    // int --> The ID of the extrusion, from which the faceset comes from.
+    std::vector<std::tuple<HMesh::FaceSet, bool, bool, std::string, int>> faces_2_be_extruded;
+    faces_2_be_extruded.push_back(std::tuple(face_set, true, false, "", -1));
+    FaceSet face_loop_faces;
+    FaceSet base_patch_faces;
+
+    map<VertexID, Vec2d> vertex_uv_map;
+    bool set_bd = true;
+    HMesh::VertexID potential_bd_v;
+    std::map<int, std::pair<HMesh::FaceSet, bool>> extrusion_face_set;
+    std::map<HMesh::FaceID, bool> face_used;
+
+    // Global variable to store the previous extrusion id
+    int previous_extrusion_id = -1;
+    std::set<int> used_previous_extrusions_ids;
+    bool use_subset_of_base_patch_faces = false;
+
+    // Global variable to store the previous extrusion id
+    std::map<int, std::vector<std::pair<HMesh::FaceSet, int>>> colocated_extrusions;
+
+    //std::vector<DAG_node> extrusion_DAG;
+
+    // TC: Datastructure for the DAG which we generate when we execute the construction script
+    //std::map<int, std::pair<std::set<int>, std::string>> extrusion_DAG;
+    std::deque<std::pair<int, std::string>> contributing_extrusions;
+    contributing_extrusions.clear();
+    std::string extrusion_text;
+    std::string contributing_extrusion_text;
+
+    // TC: Faces in face-loops for each extrusion
+    
+    //std::map<int, HMesh::FaceSet> faces_in_extrusion_face_loop;
+
+    double angle_threshold = 45.0;
+
+    // Variable to store contribution extrusion ID, faces, ref_v, and boolean whether the faces belong to the base-patch or the face-loop for the next extrusion
+    std::map<int, std::vector<std::tuple<int, HMesh::FaceSet, HMesh::VertexID, bool, std::vector<HMesh::VertexID>>>> next_ext_info;
+
+    // TC: Get every line
+    while (!command_buffer.empty()) { // Read commands until EOF
+
+        cout << "Running command: " << command_buffer.front() << endl;
+        
+        if (command_buffer.front() == "E7559!") { // 135 before
+
+            cout << "---------------------------------------------" << endl;
+            cout << "Inspecting the faces_2_be_extruded" << endl;
+            for (auto it : faces_2_be_extruded) {
+                cout << "This faceset consists of: " << endl;
+                for (auto f : std::get<0>(it)) {
+                    cout << f << " ";
+                }
+                cout << endl;
+                cout << "Is this face_set from a base-patch: " << std::get<1>(it) << endl;
+                cout << "Is this face_set bd_v responsible: " << std::get<2>(it) << endl;
+                cout << "ID of extrusion: " << std::get<4>(it) << endl;
+            }
+
+            cout << "---------------------------------------------" << endl;
+            cout << "The extrusion counter is: " << extrusion_counter << std::endl;
+            cout << "This is before fixing the face issues" << endl;
+            
+            HMesh::FaceSet prev_face_set;
+            for (auto it : faces_2_be_extruded) {
+                for (auto f : std::get<0>(it)) {
+                    prev_face_set.insert(f);
+                    cout << f << " ";
+                }
+            }
+            cout << endl;
+            cout << "The bd_v is: " << bd_v << std::endl;
+            cout << endl;
+            
+            cout << "This is after fixing the face issues" << endl;
+            for (auto f : face_set) {
+                cout << f << " ";
+            }
+            cout << endl;
+            
+            // Recheck that the bd_v is still the appropriate one - E.g. if we have removed the face, where the boundary vertex was, 
+            // because the face was wrongly selected (e.g. the face was an outlier, then we need to refind the boundary vertex)
+            cout << "The bd_v is: " << bd_v << std::endl;
+
+            cout << "---------------------------------------------" << endl;
+            cout << "Faces selected after check" << endl;
+             
+            break;
+        }
+
+        // TC: If the command is an extrusion
+        if (!command_buffer.front().empty() && command_buffer.front().at(0) == 'E') {
+            // TC: Store the command get previous extrusion
+            extrusion_text += command_buffer.front() + " ";
+
+            // Load the extrusion
+            if (command_buffer.front().substr(1).empty() || !isInteger(command_buffer.front().substr(1))) {
+                command_buffer.pop();
+                continue;
+            }
+            int Extrusion_number = stoi(command_buffer.front().substr(1));
+            
+            // TC: Pop the "E X" (Extrusion nr. X) command
+            command_buffer.pop();
+
+            //ext = load_extrusion(extrusions_directory / mesh_name / ("extrusion_" + to_string(Extrusion_number) + ".txt"));
+            
+            if (use_clustered_extrusions) {
+                ext = load_extrusion(extrusions_directory / ("extrusion_" + to_string(Extrusion_number) + ".txt"));
+            }
+            else {
+                ext = extrusion_tree[Extrusion_number];
+            }
+       
+            std::tie(face_set, bd_v) = fix_face_issues(m, bd_v, faces_2_be_extruded, face_map);
+
+            auto bd_verts = boundary_verts(m, face_set);
+            if (face_set.size() > 0 && bd_verts.find(bd_v) != bd_verts.end() && ext.stack_size > 0) {
+                // TC: Filter the faceset for bad faces
+                // Essentially, we find groups of faces and the biggest group of faces, where a group is defined as a set of connected faces.
+                // So if a face is only connected to another face by a vertex, the faces are not in the same group.
+                // If two groups are equally big, we just take the first one. 
+                // Also reinclude faces, if two of its four edges opposite to each other share a face in the faceset.
+
+           
+
+                // TC: Overwrite the boundary vertex
+                auto prev_bd_v = bd_v;
+                ext.bd_v = bd_v;
+    
+                // TC: Standard perform extrusion
+                target_boundary_perim = 0.0;
+                HMesh::HalfEdgeSet boundary_edges = boundary_hes(m, face_set);
+                for (auto h : boundary_edges) {
+                    target_boundary_perim += length(m, h);
+                }
+
+                HMesh::Manifold m_copy_before = m;
+                bool triangulation_needed = does_the_base_patch_need_to_be_triangulated(look_ahead, command_buffer) && use_split;
+
+                HMesh::Manifold m_copy_after = m;
+                if (save_intermediate_extrusions) {
+                    for (auto f : m_copy_after.faces()) {
+                        if (face_loop_faces.find(f) == face_loop_faces.end() && base_patch_faces.find(f) == base_patch_faces.end()) {
+                            m_copy_after.remove_face(f);
+                        }
+                    }
+                    for (auto f : base_patch_faces) {
+                        std::vector<CGLA::Vec3d> f_points;
+                        circulate_face_ccw(m_copy_before, f, [&](HMesh::VertexID vn){
+                            f_points.push_back(m_copy_before.pos(vn));
+                        });
+                        std::reverse(f_points.begin(), f_points.end());
+                        m_copy_after.add_face(f_points);
+                    }
+                    stitch_mesh(m, 1e-10);
+                    obj_save("extrusion_" + to_string(extrusion_counter) + ".obj", m_copy_after);
+                }
+
+                
+                auto extrusion_result = perform_extrusion(m, triangulation_needed, ext, face_set, faces_2_be_extruded, bd_v,  ext.scale, target_boundary_perim, curr_ext_faces, face_loop_faces, base_patch_faces, vertex_uv_map, extrusion_counter);
+                
+
+                target_hmap = std::get<0>(extrusion_result);
+                bd_v_positions = std::get<1>(extrusion_result);
+                prev_v_uv_map = std::get<2>(extrusion_result);
+                auto prev_m = std::get<3>(extrusion_result);
+
+                // ---------------------------------------
+                // Make a map, where we store all the vertex_uv_map
+                for (auto f : base_patch_faces) {
+                    f_2_v_uv_map[f] = vertex_uv_map;
+                }
+                for (auto f : face_loop_faces) {
+                    f_2_v_uv_map[f] = vertex_uv_map;
+                }
+                // ---------------------------------------
+
+                // TC: Store the extrusion number, previous extrusions it was dependent on and the construction text
+                //extrusion_DAG.insert(std::make_pair(extrusion_counter, std::make_pair(contributing_extrusions, construction_text)));
+                DAG_node node;
+                node.id = extrusion_counter;
+                node.contributing_extrusions = contributing_extrusions;
+                node.extrusion_text = extrusion_text;
+                node.contributing_extrusion_text = contributing_extrusion_text;
+
+                // Update the base-base patch info
+                // If ext. k + 1 follows extrusion k, we should use extrusion k as base-base patch, unless ext. k + 1 only uses a subset of the base-patch faces of extrusion k
+
+                if (contributing_extrusions.size() > 1 || extrusion_counter == 0 || (contributing_extrusions.size() == 1 && use_subset_of_base_patch_faces)) { 
+                    //cout << "Saving the new base-base mesh for node with id: " << node.id << endl;
+                    node.base_base_mesh = prev_m;
+                    node.bd_edges_base_base_patch = ccw_ordered_bd_edges(prev_m, face_set, prev_bd_v);
+                    
+                    std::string hmap_name = "base_base_mesh_hmap_for_" + to_string(extrusion_counter);
+                    HarmonicMap initial_map(prev_m, face_set, prev_bd_v, "");
+                    auto initial_v_uv_map = initial_map.compute_normal_harmonic_map_with_face_loop(prev_m, "", false, HMesh::InvalidVertexID);
+
+                    node.v_uv_map_base_base_patch.clear();
+                    for (auto v : all_verts(prev_m, face_set)) {
+                        node.v_uv_map_base_base_patch.insert({v, initial_map.patch_vertex_uv(v)});
+                    }
+                    
+                }
+                use_subset_of_base_patch_faces = false;
+
+
+                // TC: Find the loop faces - so every face in the new extrusion without the top (the base-patch thas has been extruded)
+                node.loop_faces.insert(face_loop_faces.begin(), face_loop_faces.end());
+                node.loop_faces.insert(base_patch_faces.begin(), base_patch_faces.end());
+
+                //extrusion_DAG.push_back(node);
+                ext_DAG.push_back(node);
+
+                // Add child nodes - the next extrusions
+                for (auto ext : ext_DAG[extrusion_counter].contributing_extrusions) {
+                    ext_DAG[ext.first].next_extrusions.insert(extrusion_counter);
+                }
+
+                // TC: Register these faces with the extrusion number
+                //faces_in_extrusion_face_loop.insert(std::make_pair(extrusion_counter, loop_faces));
+                // TC: Loop through the contributing extrusions and find the faces of their face-loops. If some of these faces
+                // have been extruded as part of the current extrusion then remove those faces from the face-loops
+                for (auto contrib_ext : ext_DAG[extrusion_counter].contributing_extrusions) {
+                    auto ext = ext_DAG[contrib_ext.first];
+                    auto faces_in_face_loop = ext.loop_faces;
+                    HMesh::FaceSet new_loop_faces;
+                    for (auto f : faces_in_face_loop) {
+                        if (ext_DAG[extrusion_counter].loop_faces.find(f) == ext_DAG[extrusion_counter].loop_faces.end()) {
+                            new_loop_faces.insert(f);
+                        }
+                    }
+                    ext_DAG[ext.id].loop_faces = new_loop_faces;
+                }
+
+                // TC: Clear the contributing extrusions and the text sequence responsible for the extrusion
+                contributing_extrusions.clear();
+                extrusion_text.clear();
+                
+                // TC: Save the progress of the mesh
+                if (save_intermediate_meshes) {
+                //if (true) {
+                    cout << "Saving " + ("extrusion_mesh_" + to_string(extrusion_counter) + ".obj") + (" at extrusion number: " + to_string(extrusion_counter)) << endl;
+                    obj_save("test_extrusion_mesh_" + to_string(extrusion_counter) + ".obj", m);
+                }
+
+                // Insert the just created extrusion number
+                std::string empty_text;
+                contributing_extrusions.push_back(std::make_pair(extrusion_counter, empty_text));
+
+                extrusion_counter += 1;
+
+                // Save the ID of the extrusion (PX), where X is the extrusion ID - If we need to remember the previous extrusion
+                if (!command_buffer.empty() && command_buffer.front().at(0) == 'P') {
+                    previous_extrusion_id = -1;
+
+                    // Check that it is actually an integer
+                    if (!command_buffer.front().substr(1).empty() && isInteger(command_buffer.front().substr(1))) {
+                        auto potential_previous_extrusion_id = stoi(command_buffer.front().substr(1));
+                        
+                        // Check that it has not been used before
+                        if (used_previous_extrusions_ids.find(potential_previous_extrusion_id) == used_previous_extrusions_ids.end()) {
+                            previous_extrusion_id = potential_previous_extrusion_id;
+
+                            used_previous_extrusions_ids.insert(potential_previous_extrusion_id);
+                        }
+                    }
+                    command_buffer.pop();
+                }
+            }
+            else {
+                cout << "Could not perform the extrusion" << endl;
+                cout << "face_set.size() > 0 " << (face_set.size() > 0) << endl;
+                cout << "bd_verts.find(bd_v) != bd_verts.end(): " << (bd_verts.find(bd_v) != bd_verts.end()) << endl;
+                cout << "ext.stack_size > 0: " << (ext.stack_size > 0) << endl;
+                previous_extrusion_id = -1;
+            }
+
+            
+            if (!command_buffer.empty() && (command_buffer.front() == "gp" || command_buffer.front() == "sv")) {
+                face_set.clear();
+                faces_2_be_extruded.clear();
+                contributing_extrusions.clear();
+            }
+            if (!command_buffer.empty() && command_buffer.front() != "Re") {
+                face_used.clear();
+                curr_ext_faces.clear();
+                face_loop_faces.clear();
+                base_patch_faces.clear();
+                vertex_uv_map.clear();
+            }
+
+            set_bd = true;
+
+            // Clear that need to store information about the choosing of the boundary vertex
+            bd_v_face_set.clear();
+            bd_v_vertex_uv_map.clear();
+            bd_v_curr_loop_V.resize(0,0);
+            extrusion_face_set.clear();
+            contributing_extrusion_text.clear();
+
+        }
+        // TC: gp = get previous extrusion
+        else if (command_buffer.front() == "sv") {
+            use_subset_of_base_patch_faces = true;
+ 
+            std::string construction_text;
+            // TC: Store the command get previous extrusion
+            construction_text += command_buffer.front() + " ";
+            contributing_extrusion_text += command_buffer.front() + " ";
+            
+            // TC: Discard the command
+            command_buffer.pop();
+
+            
+            // Store the yellow vertices
+            std::vector<HMesh::VertexID> yellow_vertices;
+            while (!command_buffer.empty() && isInteger(command_buffer.front())) {
+                auto v = HMesh::VertexID(stoi(command_buffer.front()));
+                yellow_vertices.push_back(v);
+
+                // TC: Store the vertex to select
+                construction_text += command_buffer.front() + " ";
+                contributing_extrusion_text += command_buffer.front() + " ";
+
+                command_buffer.pop();
+            }
+
+
+            while (!command_buffer.empty() && command_buffer.front() == "gp") {
+                FaceSet curr_face_set;
+
+                // TC: Store that we need to fetch a previous extrusion
+                construction_text += command_buffer.front() + " ";
+                contributing_extrusion_text += command_buffer.front() + " ";
+
+                // Pop gp command
+                command_buffer.pop();
+
+                // TC: The id of the contributing extrusion Get the extrusion number without the P
+                int prev_extrusion_name = -1;
+                if (!command_buffer.empty() && command_buffer.front().at(0) == 'P' && isInteger(command_buffer.front().substr(1))) {
+                    prev_extrusion_name = stoi(command_buffer.front().substr(1));
+                }
+
+                // TC: Store that we need to fetch a previous extrusion
+                construction_text += command_buffer.front() + " ";
+                contributing_extrusion_text += command_buffer.front() + " ";
+
+                command_buffer.pop();
+
+                // TC: Get the information stored with the extrusion
+                // Check that the element actually exists
+                if (face_map.find(prev_extrusion_name) != face_map.end()) {
+
+                    auto tuple_value = face_map.find(prev_extrusion_name)->second.second;
+                    Manifold m_state = std::get<0>(tuple_value);
+                    FaceSet face_loop_faces = std::get<1>(tuple_value);
+                    FaceSet base_patch_faces = std::get<2>(tuple_value);
+                    map<HMesh::VertexID,CGLA::Vec2d> vertex_uv_map = std::get<3>(tuple_value);
+                    map<HMesh::FaceID, bool> face_used = std::get<5>(tuple_value);
+
+
+                    // ------------------------------------------
+                    // Find the extrusion and face set
+                    // ------------------------------------------
+                    std::queue<std::string> command_buffer_copy = command_buffer;
+
+                    while (!command_buffer_copy.empty() && command_buffer_copy.front().at(0) != 'E') {
+                        command_buffer_copy.pop();
+                    }
+                    // Since we cannot use EX, where X is the extrusion number, because this number is not unique when we start to make clusters, we instead use PY, where Y is the extrusion id.
+                    // Since EX will always be followed by PY in the construction sequence, we just need to pop one more time.
+                    command_buffer_copy.pop(); // This pops EX 
+
+                    // Do a sanity check. Check that the next sequence actually starts with P and that the substring is actually an integer.
+                    int next_extrusion_name = -1; 
+                    if (command_buffer_copy.front().at(0) == 'P' && isInteger(command_buffer_copy.front().substr(1))) {
+                        next_extrusion_name = stoi(command_buffer_copy.front().substr(1)); // This gets Y in PY
+                    }
+
+                    potential_bd_v = HMesh::InvalidVertexID;
+                    if (next_ext_info.find(next_extrusion_name) != next_ext_info.end()) {
+                        for (auto it : next_ext_info[next_extrusion_name]) {
+                            int prev_ext = std::get<0>(it);
+
+                            if (prev_ext == prev_extrusion_name && std::get<4>(it) == yellow_vertices) {
+
+                                auto fs_tmp = std::get<1>(it);
+                                HMesh::FaceSet fs;
+                                for (auto f : fs_tmp) {
+                                    if (m.in_use(f)) {
+                                        fs.insert(f);
+                                    }
+                                }
+                                potential_bd_v = std::get<2>(it);
+                                bool is_inside_base_patch = std::get<3>(it);
+
+                                
+                                //cout << "Adding the following faces: " << endl;
+                                for (auto f : fs) {
+                                    curr_face_set.insert(f);
+                                }
+
+                                // Store which faces to be extruded, whether it is inside the base patch, and whether this face set is reponsible for the reference vertex ref_v, and the bd coodinates
+                                auto temp_command_buffer = command_buffer;
+                                temp_command_buffer.pop();
+
+                                if (!fs.empty()) {
+                                    // If we need faces from a previous extrusion, where the faces are both from the face-set and from the face-loop, and this extrusion is also responsible for the bd_v, 
+                                    // then only the part that is within the base-patch can be responsible for the extrusion. Therefore, we should run through faces_2_be_extruded and ensure that the one with 
+                                    // the base-patch faces becomes bd_v responsible.
+                                    faces_2_be_extruded.push_back(std::make_tuple(fs, is_inside_base_patch, command_buffer.front() == "bd", temp_command_buffer.front(), prev_extrusion_name));
+
+                                    // We do this in case we need multiple faces from the same extrusion - e.g. if we from Extrusion EK need both faces from the base-patch but also faces from the face-loop.
+                                    // This is the case for MANO hands
+                                    //cout << "Inserting the fs into extrusion_face_set" << endl;
+                                    //cout.flush();
+
+                                    if (extrusion_face_set.find(prev_ext) == extrusion_face_set.end()) {
+                                        extrusion_face_set.insert({prev_ext, std::make_pair(fs, is_inside_base_patch)});
+                                    }
+                                    else {
+                                        // If it is base-patch faces
+                                        if (is_inside_base_patch) {
+                                            extrusion_face_set[prev_ext].first.clear();
+                                            extrusion_face_set[prev_ext].first = fs;
+                                            extrusion_face_set[prev_ext].second = is_inside_base_patch;
+                                        }
+                                        else { // If it is face-loop faces then only insert, if the elements in it are also face-loop faces
+                                            if (!extrusion_face_set[prev_ext].second) {
+                                                for (auto f : fs) {
+                                                    extrusion_face_set[prev_ext].first.insert(f);
+                                                }
+                                            }
+                                        }
+
+
+                                    }
+                                }
+                            }
+                        }
+                    }
+                
+                    // ---------------------
+                    // The boundary vertex
+                    // ---------------------
+                    // TC: If we need faces on the sides of the extrusion, we also need a boundary vertex, and this wee need to find using this method
+                    if (command_buffer.front() == "bd") {
+                        
+                        /*
+                        cout << "Finding the boundary vertex using prev_extrusion_name: " << prev_extrusion_name << endl;
+                        cout << "the potential_bd_v is: " << potential_bd_v << endl; 
+                        cout.flush();
+                        */
+                        
+                        // TC: Store the boundary vertex command 
+                        construction_text += command_buffer.front() + " ";
+                        contributing_extrusion_text += command_buffer.front() + " ";
+
+                        // TC: Set the boundary vertex
+                        // TC: Pop "set_bd_vertex"
+                        command_buffer.pop();
+
+                        //if (potential_bd_v == HMesh::InvalidVertexID) {
+                        auto bd_v_index = HMesh::VertexID(stoi(command_buffer.front()));
+
+                        // TC: Store the boundary vertex id 
+                        construction_text += command_buffer.front() + " ";
+                        contributing_extrusion_text += command_buffer.front() + " ";
+
+                        // TC: Comment - 15.11.2025
+                        // Pop the bd_vertex on the generic extrusion
+                        command_buffer.pop();
+
+                        auto bd_v_coordinates = gen_ext.get_vertex_uv_map().find(bd_v_index)->second;
+
+                        auto temp_fs = extrusion_face_set.find(prev_extrusion_name)->second.first;
+
+                        HMesh::FaceSet fs;
+                        for (auto f : temp_fs) {
+                            if (m.in_use(f)) {
+                                fs.insert(f);
+                            }
+                        }
+
+                        double cutoff = 2.5;
+
+                        vertex_uv_map = f_2_v_uv_map.find(*fs.begin())->second;
+                        
+                        //auto [angle, ref_v, peak_bd_vertices] = compute_new_bd_v_with_high_curvature(m_state, fs, vertex_uv_map, boundary_hes(m_state, fs), cutoff);
+                        auto [angle, ref_v, peak_bd_vertices] = compute_new_bd_v_with_high_curvature(m, fs, vertex_uv_map, boundary_hes(m, fs), cutoff);
+
+                        double min_dist = std::numeric_limits<double>::infinity();
+                        for (auto it : peak_bd_vertices) {
+                            auto v = it.first;
+                            //cout << "Investigating peak_bd_vertex: " << v << " with coordinates: " << bd_v_coordinates << endl;
+                            auto dist = length(vertex_uv_map.find(v)->second - bd_v_coordinates);
+                            if (dist < min_dist) {
+                                min_dist = dist;
+                                bd_v = v;
+                            }
+                        }
+                        set_bd = false;
+                    }
+
+                    // Insert 
+                    for (auto f : curr_face_set) {
+                        face_set.insert(f);
+                    }
+
+                    int id_of_contributing_extrusion = face_map.find(prev_extrusion_name)->second.first;
+                    contributing_extrusions.push_back(std::make_pair(id_of_contributing_extrusion, construction_text));
+                }
+            }
+        }
+        else if (command_buffer.front() == "gp") {
+            use_subset_of_base_patch_faces = false;
+            contributing_extrusion_text += command_buffer.front() + " ";
+
+            // Pop gp command
+            command_buffer.pop();
+
+            // Get the extrusion number without the P
+            int prev_extrusion_name = -1;
+            if (command_buffer.front().at(0) == 'P' && !command_buffer.front().substr(1).empty() && isInteger(command_buffer.front().substr(1))) {
+                prev_extrusion_name = stoi(command_buffer.front().substr(1));
+            }
+            contributing_extrusion_text += command_buffer.front() + " ";
+
+            command_buffer.pop();
+
+            // TC: The id of the contributing extrusion
+            std::string construction_text;
+
+            // TC: Get the information stored with the extrusion
+            // Check that the element actually exists
+            if (face_map.find(prev_extrusion_name) != face_map.end()) {
+                auto tuple_value = face_map.find(prev_extrusion_name)->second.second;
+                Manifold m_state = std::get<0>(tuple_value);
+                FaceSet face_loop_faces = std::get<1>(tuple_value);
+                FaceSet base_patch_faces = std::get<2>(tuple_value);
+                map<HMesh::VertexID,CGLA::Vec2d> vertex_uv_map = std::get<3>(tuple_value);
+                map<HMesh::FaceID, bool> face_used = std::get<5>(tuple_value);
+
+                FaceSet curr_face_set = base_patch_faces;
+
+                if (set_bd) {
+                    bd_v = std::get<4>(tuple_value);
+                }
+
+                // In the rare case, that Extrusion EK depends on a some faces from the face-loop of extrusion EN and the entire base-patch of extrusion EK,
+                // then we need to check, if the next command is bd
+                if (command_buffer.front() == "bd") {
+
+                    //cout << "Finding the boundary vertex using prev_extrusion_name: " << prev_extrusion_name << endl;
+                    //cout << "the potential_bd_v is: " << potential_bd_v << endl; 
+                    // TC: Store the boundary vertex command 
+                    construction_text += command_buffer.front() + " ";
+                    contributing_extrusion_text += command_buffer.front() + " ";
+
+                    // TC: Set the boundary vertex
+                    // TC: Pop "set_bd_vertex"
+                    command_buffer.pop();
+
+                    auto bd_v_index = HMesh::VertexID(stoi(command_buffer.front()));
+
+                    // TC: Store the boundary vertex id 
+                    construction_text += command_buffer.front() + " ";
+                    contributing_extrusion_text += command_buffer.front() + " ";
+
+                    faces_2_be_extruded.push_back(std::tuple(base_patch_faces, true, true, command_buffer.front(), prev_extrusion_name));
+                    command_buffer.pop();
+
+                    auto bd_v_coordinates = gen_ext.get_vertex_uv_map().find(bd_v_index)->second;
+                    //cout << "The bd_v_coordinates are: " << bd_v_coordinates << endl;
+
+                    vertex_uv_map = f_2_v_uv_map.find(*curr_face_set.begin())->second;
+
+                    //auto peak_bd_vertices = boundary_verts(m_state, curr_face_set);
+                    //auto [angle, ref_v, peak_bd_vertices] = compute_new_bd_v_with_high_curvature(m_state, curr_face_set, vertex_uv_map, boundary_hes(m_state, curr_face_set), 2.5);
+                    auto [angle, ref_v, peak_bd_vertices] = compute_new_bd_v_with_high_curvature(m, curr_face_set, vertex_uv_map, boundary_hes(m, curr_face_set), 2.5);
+
+                    double min_dist = std::numeric_limits<double>::infinity();
+                    for (auto it : peak_bd_vertices) {
+                        auto v = it.first;
+                        auto dist = length(vertex_uv_map.find(v)->second - bd_v_coordinates);
+                        if (dist < min_dist) {
+                            min_dist = dist;
+                            bd_v = v;
+                        }
+                    }
+                    //cout << "So the bd_v is: " << bd_v << " with uv_coordinates: " << vertex_uv_map.find(bd_v)->second << endl;
+
+                    set_bd = false;
+                }
+                else {
+                    //cout << "Did not use subset of patch" << endl;
+                    faces_2_be_extruded.push_back(std::tuple(base_patch_faces, true, false, "", prev_extrusion_name));
+                }
+
+
+                // Insert 
+                for (auto f : curr_face_set) {
+                    face_set.insert(f);
+                }
+
+                int id_of_contributing_extrusion = face_map.find(prev_extrusion_name)->second.first;
+                contributing_extrusions.push_back(std::make_pair(id_of_contributing_extrusion, construction_text));
+
+            }
+
+        }
+        else if (command_buffer.front() == "Re" && previous_extrusion_id != -1) {
+
+            // TC: Store the Remember command
+            //ext_DAG[extrusion_counter - 1].construction_text += command_buffer.front() + " ";
+
+            // TC: Pop the remember command
+            command_buffer.pop();
+
+            //ext_DAG[extrusion_counter - 1].construction_text += command_buffer.front() + " ";
+
+            // Ensure that we can use all faces from the extrusion
+            for (auto f : curr_ext_faces) {
+                face_used.insert(std::make_pair(f, false));
+            }
+            
+            std::string extrusion_name = "P" + to_string(previous_extrusion_id);
+            auto next_extrusions = find_dependent_extrusions(look_ahead, extrusion_name);
+
+            std::vector<std::tuple<int, MatrixXd, CGLA::Vec2d, std::vector<HMesh::VertexID>>> loops;
+
+            for (auto selection_set : next_extrusions) {
+                CGLA::Vec2d bd_v_coordinates = CGLA::Vec2d(2.0, 0.0); // The coordinates of the boundary vertex - Just set it to some value, which is outside the unit circle
+
+                std::vector<HMesh::VertexID> yellow_vertices;
+                for (int jj = 0; jj < selection_set.size()-1; jj++) {
+                    if (selection_set[jj] == "bd" || (jj >= 1 && selection_set[jj-1] == "bd")) {
+                        //cout << "selection_set[jj]: " << selection_set[jj] << endl;
+                        //cout.flush();
+                        if (isInteger(selection_set[jj])) {
+                            bd_v_coordinates = gen_ext.get_vertex_uv_map().find(HMesh::VertexID(stoi(selection_set[jj])))->second;
+                        }
+                    }
+                    else {
+                        //cout << "selection_set[jj]: " << selection_set[jj] << endl;
+                        //cout.flush();
+                        if (isInteger(selection_set[jj])) {
+                            //cout << "Trying to map " << selection_set[jj] << " to a yellow vertex" << endl;
+                            cout.flush();
+                            yellow_vertices.push_back(HMesh::VertexID(stoi( selection_set[jj] )));
+                            //cout << "Succeeded" << endl;
+                        }
+                    }
+                }
+                //cout << "About to obtain the curr_loop_V" << endl;
+                //cout.flush();
+                MatrixXd curr_loop_V = find_yellow_loop(gen_ext, yellow_vertices);  
+
+                //cout << "About to mape the extrusion id: " << selection_set[selection_set.size()-1].substr(1) << endl;
+                //cout.flush();
+                int extrusion_id = stoi(selection_set[selection_set.size()-1].substr(1));
+                
+                loops.push_back(std::tuple(extrusion_id, curr_loop_V, bd_v_coordinates, yellow_vertices));
+            }
+
+            
+            // Backtrack to the latest node in the DAG, which is either:
+            // 1) The original extrusion
+            // 2) An extrusion having more than 1 contributing extrusions (e.g. more parenets)
+
+
+            if (previous_extrusion_id < ext_DAG.size()) {
+                auto DAG_node = ext_DAG[previous_extrusion_id];
+
+                while (ext_DAG.size() > 1 && DAG_node.contributing_extrusions.size() == 1 && DAG_node.v_uv_map_base_base_patch.empty()) {
+
+                    DAG_node = ext_DAG[DAG_node.contributing_extrusions.front().first];
+                }
+ 
+                base_base_mesh = DAG_node.base_base_mesh;
+                bd_edges_base_base_patch = DAG_node.bd_edges_base_base_patch;
+                v_uv_map_base_base_patch = DAG_node.v_uv_map_base_base_patch;
+            }
+
+            HMesh::Manifold m_state = m;
+            std::map<HMesh::VertexID, std::tuple<CGLA::Vec2d, HMesh::VertexID, HMesh::VertexID, double>> new_vertices;
+
+            // Copy of the mesh and the base-patch faces
+            HMesh::Manifold m_copy = m;
+            HMesh::FaceSet base_patch_faces_copy = base_patch_faces;
+            auto vertex_uv_map_copy = vertex_uv_map;
+
+            auto curve_enclosed_areas = find_extrusion_area(m, 
+                                                            m_state, 
+                                                            face_loop_faces, 
+                                                            base_patch_faces, 
+                                                            vertex_uv_map,
+                                                             loops, 
+                                                             new_vertices, 
+                                                             prev_v_uv_map,
+                                                             use_split, to_string(previous_extrusion_id),
+                                                            gen_ext,
+                                                             base_base_mesh,
+                                                            bd_edges_base_base_patch,
+                                                            v_uv_map_base_base_patch);
+
+
+            // Extrude positions of newly inserted vertices
+            // This handles the following situtation E83 Re 13 E82, where we don't change the base-patch of E83, if we don't have to.
+            if (new_vertices.size() > 0) {
+                delaunay_triangulate_each_single_face2(m, m_copy, base_patch_faces, base_patch_faces_copy, vertex_uv_map, vertex_uv_map_copy, curve_enclosed_areas, new_vertices);
+                geometric_extrude_new_vertices(m, ext, target_hmap, target_boundary_perim, bd_v_positions, new_vertices);
+
+                // ---------------------------------------
+                // Update that map that associates each face to the vertex_uv_map of the extrusion, which created the face
+                for (auto f : base_patch_faces) {
+                    f_2_v_uv_map[f] = vertex_uv_map;
+                }
+                for (auto f : face_loop_faces) {
+                    f_2_v_uv_map[f] = vertex_uv_map;
+                }
+                // ---------------------------------------
+        
+            }
+
+            for (auto it : curve_enclosed_areas) {
+                int extrusion_id = std::get<0>(it);
+                auto yellow_faces = std::get<1>(it);
+                auto potential_bd_v = std::get<2>(it);
+                auto is_inside_base_patch = std::get<3>(it);
+                auto yellow_vertices = std::get<4>(it);
+
+                if (next_ext_info.find(extrusion_id) == next_ext_info.end()) {
+                    next_ext_info.insert({
+                        extrusion_id, 
+                        {std::make_tuple(previous_extrusion_id, yellow_faces, potential_bd_v, is_inside_base_patch, yellow_vertices)}});
+                }
+                else {
+                    next_ext_info[extrusion_id].push_back(std::make_tuple(previous_extrusion_id, yellow_faces, potential_bd_v, is_inside_base_patch, yellow_vertices));
+                }
+            }
+
+            // TC: Store the state of the mesh after this extrusion;
+            face_map.insert(std::make_pair(previous_extrusion_id, 
+                                        std::make_pair(extrusion_counter - 1, 
+                                            make_tuple(m, 
+                                                face_loop_faces, 
+                                                base_patch_faces, 
+                                                vertex_uv_map, 
+                                                bd_v, 
+                                                face_used,
+                                                base_base_mesh,
+                                                bd_edges_base_base_patch,
+                                                v_uv_map_base_base_patch))));
+
+            
+            // TC: The following situation might happen: Extrusion 82 is a direct continuation of Extrusion 83, but extrusion 83 also contributes to
+            // e.g. extrusion 29 and 13 but extrusion 13 and extrusion 29 only needs faces on the 'side' of extrusion 83 and not from the top. Therefore,
+            // we should only clear the face_set, if the next extrusion needs new faces.
+            if (command_buffer.front() == "sv" || command_buffer.front() == "gp") {
+                face_set.clear();
+                faces_2_be_extruded.clear();
+                //construction_text.clear();
+                contributing_extrusions.clear();
+                contributing_extrusion_text.clear();
+            }
+            else if (command_buffer.front().at(0) == 'E') {
+                face_set = base_patch_faces;
+                faces_2_be_extruded.clear();
+                auto new_bd_v = gen_ext.get_closest_vertex(vertex_uv_map.find(bd_v)->second);
+                faces_2_be_extruded.push_back({base_patch_faces, true, true, to_string(new_bd_v.index), previous_extrusion_id});
+            }
+
+            // Clear the variables
+            face_loop_faces.clear();
+            base_patch_faces.clear();
+            vertex_uv_map.clear();
+            face_used.clear();
+            // Reset the previous_extrusion_id
+            previous_extrusion_id = -1;
+            
+        }
+        // If it is none of the above, then we just pop
+        else {
+            command_buffer.pop();
+        }
+
+    }
+
+    pre_ext_pos = m.positions_attribute_vector();
+
+    post_ext_pos = m.positions_attribute_vector();
+
+    return ext_DAG;
+    
+}
