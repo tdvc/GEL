@@ -51,21 +51,28 @@ FetchContent_MakeAvailable(nanoflann)
 FetchContent_Declare(
   dtaidistance
   GIT_REPOSITORY https://github.com/wannesm/dtaidistance.git
-  GIT_TAG master
+  GIT_TAG v2.3.10 # Better than master; or pin a commit hash
 )
 
-FetchContent_GetProperties(dtaidistance)
-if(NOT dtaidistance_POPULATED)
-  FetchContent_Populate(dtaidistance)
-endif()
+FetchContent_MakeAvailable(dtaidistance)
+
+message(STATUS "dtaidistance source dir: ${dtaidistance_SOURCE_DIR}")
+
+set(DTAIDISTANCE_C_DIR
+  "${dtaidistance_SOURCE_DIR}/dtaidistance/lib/DTAIDistanceC/DTAIDistanceC"
+)
+
+set(DTAIDISTANCE_C_SOURCES
+  "${DTAIDISTANCE_C_DIR}/dd_dtw.c"
+  "${DTAIDISTANCE_C_DIR}/dd_ed.c"
+)
 
 add_library(dtaidistance_c STATIC
-  ${dtaidistance_SOURCE_DIR}/src/dtaidistance/lib/DTAIDistanceC/DTAIDistanceC/dd_dtw.c
-  ${dtaidistance_SOURCE_DIR}/src/dtaidistance/lib/DTAIDistanceC/DTAIDistanceC/dd_ed.c
+  ${DTAIDISTANCE_C_SOURCES}
 )
 
 target_include_directories(dtaidistance_c PUBLIC
-  ${dtaidistance_SOURCE_DIR}/src/dtaidistance/lib/DTAIDistanceC/DTAIDistanceC
+  "${DTAIDISTANCE_C_DIR}"
 )
 
 # Eigen library
